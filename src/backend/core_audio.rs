@@ -14,14 +14,15 @@ use std::{
 };
 use thiserror::Error;
 
+#[allow(clippy::complexity)]
+struct CallbackWrapper(Box<dyn FnMut(&mut [f32], usize)>);
+
 pub struct CoreAudioBackend {
     device: AudioDeviceID,
     device_info: DeviceInfo,
     output_channel_count: usize,
     audio_io_proc: Option<AudioDeviceIOProcID>,
-
-    #[allow(clippy::type_complexity)]
-    callback: Option<Box<dyn FnMut(&mut [f32], usize)>>,
+    callback: Option<Box<CallbackWrapper>>,
 }
 
 impl CoreAudioBackend {
@@ -330,18 +331,21 @@ impl Backend for CoreAudioBackend {
         C: FnMut(&mut [f32], usize) + Send + 'static,
     {
         self.stop();
-        self.callback = Some(Box::new(callback));
+
+        let mut callback_wrapper = Box::new(CallbackWrapper(Box::new(callback)));
 
         let mut proc_id = MaybeUninit::<AudioDeviceIOProcID>::uninit();
         coreaudio::Error::from_os_status(unsafe {
             AudioDeviceCreateIOProcID(
                 self.device,
                 Some(audio_io_proc),
-                self as *mut Self as *mut c_void,
+                callback_wrapper.as_mut() as *mut CallbackWrapper as *mut c_void,
                 proc_id.as_mut_ptr(),
             )
         })
         .unwrap();
+
+        self.callback = Some(callback_wrapper);
 
         let proc_id = unsafe { proc_id.assume_init() };
 
@@ -395,14 +399,13 @@ unsafe extern "C" fn audio_io_proc(
         slice::from_raw_parts_mut(ptr, list.mNumberBuffers as usize)
     };
 
-    let backend = user_data.cast::<CoreAudioBackend>().as_mut().unwrap();
-    let callback = backend.callback.as_mut().unwrap();
+    let callback = user_data.cast::<CallbackWrapper>().as_mut().unwrap();
 
     let channels = slice::from_raw_parts_mut(
         output_buffers[0].mData.cast::<f32>(),
         output_buffers[0].mDataByteSize as usize / size_of::<f32>(),
     );
-    (*callback)(
+    callback.0(
         channels,
         channels.len() / output_buffers[0].mNumberChannels as usize,
     );
