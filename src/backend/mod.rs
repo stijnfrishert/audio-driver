@@ -3,7 +3,7 @@ use thiserror::Error;
 #[cfg(target_os = "macos")]
 pub mod core_audio;
 
-pub trait Backend {
+pub trait Backend: Send {
     /// Configure the settings to use for the audio callback
     fn configure(&mut self, configuration: Configuration) -> Result<(), ConfigureError>;
 
