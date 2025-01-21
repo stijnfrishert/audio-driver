@@ -15,14 +15,14 @@ use std::{
 use thiserror::Error;
 
 #[allow(clippy::complexity)]
-struct CallbackWrapper(Box<dyn FnMut(&mut [f32], usize) + Send>);
+struct Callback(Box<dyn FnMut(&mut [f32], usize) + Send>);
 
 pub struct CoreAudioBackend {
     device: AudioDeviceID,
     device_info: DeviceInfo,
     output_channel_count: usize,
     audio_io_proc: Option<AudioDeviceIOProcID>,
-    callback: Option<Box<CallbackWrapper>>,
+    callback: Option<*mut Callback>,
 }
 
 impl CoreAudioBackend {
@@ -259,6 +259,9 @@ impl CoreAudioBackend {
     }
 }
 
+unsafe impl Send for CoreAudioBackend {}
+unsafe impl Sync for CoreAudioBackend {}
+
 impl Drop for CoreAudioBackend {
     fn drop(&mut self) {
         self.stop()
@@ -332,20 +335,21 @@ impl Backend for CoreAudioBackend {
     {
         self.stop();
 
-        let mut callback_wrapper = Box::new(CallbackWrapper(Box::new(callback)));
+        let callback = Box::new(Callback(Box::new(callback)));
+        let callback = Box::into_raw(callback);
 
         let mut proc_id = MaybeUninit::<AudioDeviceIOProcID>::uninit();
         coreaudio::Error::from_os_status(unsafe {
             AudioDeviceCreateIOProcID(
                 self.device,
                 Some(audio_io_proc),
-                callback_wrapper.as_mut() as *mut CallbackWrapper as *mut c_void,
+                callback as *mut c_void,
                 proc_id.as_mut_ptr(),
             )
         })
         .unwrap();
 
-        self.callback = Some(callback_wrapper);
+        self.callback = Some(callback);
 
         let proc_id = unsafe { proc_id.assume_init() };
 
@@ -369,7 +373,10 @@ impl Backend for CoreAudioBackend {
     fn stop(&mut self) {
         if let Some(proc_id) = self.audio_io_proc.take() {
             unsafe { AudioDeviceDestroyIOProcID(self.device, proc_id) };
-            self.callback = None;
+
+            if let Some(callback) = self.callback.take() {
+                let _ = unsafe { Box::from_raw(callback) };
+            }
         }
     }
 
@@ -399,7 +406,7 @@ unsafe extern "C" fn audio_io_proc(
         slice::from_raw_parts_mut(ptr, list.mNumberBuffers as usize)
     };
 
-    let callback = user_data.cast::<CallbackWrapper>().as_mut().unwrap();
+    let callback = user_data.cast::<Callback>().as_mut().unwrap();
 
     let channels = slice::from_raw_parts_mut(
         output_buffers[0].mData.cast::<f32>(),
