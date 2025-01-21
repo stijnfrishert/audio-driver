@@ -15,7 +15,7 @@ use std::{
 use thiserror::Error;
 
 #[allow(clippy::complexity)]
-struct CallbackWrapper(Box<dyn FnMut(&mut [f32], usize)>);
+struct CallbackWrapper(Box<dyn FnMut(&mut [f32], usize) + Send>);
 
 pub struct CoreAudioBackend {
     device: AudioDeviceID,
