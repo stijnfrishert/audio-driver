@@ -11,9 +11,7 @@ pub trait Backend: Send + Sync {
     fn configuration(&self) -> Configuration;
 
     /// Start the audio callback
-    fn start<C>(&mut self, callback: C) -> Result<(), StartError>
-    where
-        C: FnMut(&mut [f32], usize) + Send + 'static;
+    fn start(&mut self, callback: Box<AudioCallback>) -> Result<(), StartError>;
 
     /// Stop the audio callback
     fn stop(&mut self);
@@ -21,6 +19,9 @@ pub trait Backend: Send + Sync {
     /// Is the audio callback running
     fn has_started(&self) -> bool;
 }
+
+/// The audio callback that will be called by the audio backend
+pub type AudioCallback = dyn FnMut(&mut [f32], usize) + Send + 'static;
 
 /// Settings used for running an audio callback
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

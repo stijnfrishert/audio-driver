@@ -1,4 +1,4 @@
-use super::{Backend, Configuration, ConfigureError, StartError};
+use super::{AudioCallback, Backend, Configuration, ConfigureError, StartError};
 use coreaudio::sys::{
     self, noErr, AudioBuffer, AudioBufferList, AudioDeviceCreateIOProcID,
     AudioDeviceDestroyIOProcID, AudioDeviceID, AudioDeviceIOProcID, AudioDeviceStart,
@@ -329,13 +329,10 @@ impl Backend for CoreAudioBackend {
         }
     }
 
-    fn start<C>(&mut self, callback: C) -> Result<(), StartError>
-    where
-        C: FnMut(&mut [f32], usize) + Send + 'static,
-    {
+    fn start(&mut self, callback: Box<AudioCallback>) -> Result<(), StartError> {
         self.stop();
 
-        let callback = Box::new(Callback(Box::new(callback)));
+        let callback = Box::new(Callback(callback));
         let callback = Box::into_raw(callback);
 
         let mut proc_id = MaybeUninit::<AudioDeviceIOProcID>::uninit();
