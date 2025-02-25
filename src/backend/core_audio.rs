@@ -1,14 +1,13 @@
 use super::{AudioCallback, Backend, Configuration, ConfigureError, StartError};
 use coreaudio::sys::{
-    self, noErr, AudioBuffer, AudioBufferList, AudioDeviceCreateIOProcID,
-    AudioDeviceDestroyIOProcID, AudioDeviceID, AudioDeviceIOProcID, AudioDeviceStart,
-    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
-    AudioObjectPropertyAddress, AudioObjectSetPropertyData, AudioTimeStamp, AudioValueRange,
-    OSStatus,
+    self, AudioBuffer, AudioBufferList, AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID,
+    AudioDeviceID, AudioDeviceIOProcID, AudioDeviceStart, AudioObjectGetPropertyData,
+    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
+    AudioObjectSetPropertyData, AudioTimeStamp, AudioValueRange, OSStatus, noErr,
 };
 use std::{
     ffi::c_void,
-    mem::{size_of, MaybeUninit},
+    mem::{MaybeUninit, size_of},
     ops::RangeInclusive,
     slice,
 };
@@ -392,23 +391,26 @@ unsafe extern "C" fn audio_io_proc(
     user_data: *mut c_void,
 ) -> OSStatus {
     let _input_buffers = {
-        let list = input.as_ref().unwrap();
+        let list = unsafe { input.as_ref() }.unwrap();
         let ptr = &list.mBuffers[0] as *const AudioBuffer;
-        slice::from_raw_parts(ptr, list.mNumberBuffers as usize)
+        unsafe { slice::from_raw_parts(ptr, list.mNumberBuffers as usize) }
     };
 
     let output_buffers = {
-        let list = output.as_mut().unwrap();
+        let list = unsafe { output.as_mut() }.unwrap();
         let ptr = &mut list.mBuffers[0] as *mut AudioBuffer;
-        slice::from_raw_parts_mut(ptr, list.mNumberBuffers as usize)
+        unsafe { slice::from_raw_parts_mut(ptr, list.mNumberBuffers as usize) }
     };
 
-    let callback = user_data.cast::<Callback>().as_mut().unwrap();
+    let callback = user_data.cast::<Callback>();
+    let callback = unsafe { callback.as_mut() }.unwrap();
 
-    let channels = slice::from_raw_parts_mut(
-        output_buffers[0].mData.cast::<f32>(),
-        output_buffers[0].mDataByteSize as usize / size_of::<f32>(),
-    );
+    let channels = {
+        let data = output_buffers[0].mData.cast::<f32>();
+        let len = output_buffers[0].mDataByteSize as usize / size_of::<f32>();
+        unsafe { slice::from_raw_parts_mut(data, len) }
+    };
+
     callback.0(
         channels,
         channels.len() / output_buffers[0].mNumberChannels as usize,
