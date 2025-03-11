@@ -3,7 +3,10 @@ use thiserror::Error;
 #[cfg(target_os = "macos")]
 pub mod core_audio;
 
-pub trait Backend: Send + Sync {
+pub trait Backend: Sized + Send + Sync {
+    /// Construct a new audio backend
+    fn new(configuration: Configuration) -> Result<Self, NewBackendError>;
+
     /// Configure the settings to use for the audio callback
     fn configure(&mut self, configuration: Configuration) -> Result<(), ConfigureError>;
 
@@ -39,6 +42,15 @@ impl Configuration {
             buffer_size,
         }
     }
+}
+
+#[derive(Debug, Error)]
+pub enum NewBackendError {
+    #[error("Could not find the default output device")]
+    NoDefaultDevice,
+
+    #[error("The provided configuration was not supported")]
+    UnsupportedConfiguration,
 }
 
 #[derive(Debug, Error)]

@@ -1,4 +1,4 @@
-use super::{AudioCallback, Backend, Configuration, ConfigureError, StartError};
+use super::{AudioCallback, Backend, Configuration, ConfigureError, NewBackendError, StartError};
 use coreaudio::sys::{
     self, AudioBuffer, AudioBufferList, AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID,
     AudioDeviceID, AudioDeviceIOProcID, AudioDeviceStart, AudioObjectGetPropertyData,
@@ -11,7 +11,6 @@ use std::{
     ops::RangeInclusive,
     slice,
 };
-use thiserror::Error;
 
 #[allow(clippy::complexity)]
 struct Callback(Box<dyn FnMut(&mut [f32], usize) + Send>);
@@ -25,51 +24,6 @@ pub struct CoreAudioBackend {
 }
 
 impl CoreAudioBackend {
-    /// Construct the backend with the default output device selected
-    pub fn new(configuration: Configuration) -> Result<Self, CoreAudioBackendNewError> {
-        // The backend is just always going to use the default device
-        let device =
-            Self::default_device(false).map_err(|_| CoreAudioBackendNewError::NoDefaultDevice)?;
-
-        // Retrieve the available settings for this device, and check if it supports out configuration
-        let device_info = Self::get_device_info(device, false).unwrap();
-
-        if !device_info.supports(&configuration) {
-            return Err(CoreAudioBackendNewError::UnsupportedConfiguration);
-        }
-
-        // Set the sample rate and buffer size
-        Self::set_property_data(
-            device,
-            &AudioObjectPropertyAddress {
-                mSelector: sys::kAudioDevicePropertyNominalSampleRate,
-                mScope: sys::kAudioObjectPropertyScopeWildcard,
-                mElement: sys::kAudioObjectPropertyElementMain,
-            },
-            &(configuration.sample_rate as f64),
-        )
-        .unwrap();
-
-        Self::set_property_data(
-            device,
-            &AudioObjectPropertyAddress {
-                mSelector: sys::kAudioDevicePropertyBufferFrameSize,
-                mScope: sys::kAudioObjectPropertyScopeWildcard,
-                mElement: sys::kAudioObjectPropertyElementMain,
-            },
-            &(configuration.buffer_size as u32),
-        )
-        .unwrap();
-
-        Ok(Self {
-            device,
-            device_info,
-            output_channel_count: configuration.channel_count,
-            audio_io_proc: None,
-            callback: None,
-        })
-    }
-
     fn default_device(is_input: bool) -> Result<AudioDeviceID, coreaudio::Error> {
         let selector = if is_input {
             sys::kAudioHardwarePropertyDefaultInputDevice
@@ -268,6 +222,50 @@ impl Drop for CoreAudioBackend {
 }
 
 impl Backend for CoreAudioBackend {
+    /// Construct the backend with the default output device selected
+    fn new(configuration: Configuration) -> Result<Self, NewBackendError> {
+        // The backend is just always going to use the default device
+        let device = Self::default_device(false).map_err(|_| NewBackendError::NoDefaultDevice)?;
+
+        // Retrieve the available settings for this device, and check if it supports out configuration
+        let device_info = Self::get_device_info(device, false).unwrap();
+
+        if !device_info.supports(&configuration) {
+            return Err(NewBackendError::UnsupportedConfiguration);
+        }
+
+        // Set the sample rate and buffer size
+        Self::set_property_data(
+            device,
+            &AudioObjectPropertyAddress {
+                mSelector: sys::kAudioDevicePropertyNominalSampleRate,
+                mScope: sys::kAudioObjectPropertyScopeWildcard,
+                mElement: sys::kAudioObjectPropertyElementMain,
+            },
+            &(configuration.sample_rate as f64),
+        )
+        .unwrap();
+
+        Self::set_property_data(
+            device,
+            &AudioObjectPropertyAddress {
+                mSelector: sys::kAudioDevicePropertyBufferFrameSize,
+                mScope: sys::kAudioObjectPropertyScopeWildcard,
+                mElement: sys::kAudioObjectPropertyElementMain,
+            },
+            &(configuration.buffer_size as u32),
+        )
+        .unwrap();
+
+        Ok(Self {
+            device,
+            device_info,
+            output_channel_count: configuration.channel_count,
+            audio_io_proc: None,
+            callback: None,
+        })
+    }
+
     fn configure(&mut self, configuration: Configuration) -> Result<(), ConfigureError> {
         if self.has_started() {
             Err(ConfigureError::AlreadyStarted)
@@ -417,15 +415,6 @@ unsafe extern "C" fn audio_io_proc(
     );
 
     noErr as i32
-}
-
-#[derive(Debug, Error)]
-pub enum CoreAudioBackendNewError {
-    #[error("Could not find the default output device")]
-    NoDefaultDevice,
-
-    #[error("The provided configuration was not supported")]
-    UnsupportedConfiguration,
 }
 
 struct DeviceInfo {
