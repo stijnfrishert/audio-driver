@@ -15,14 +15,16 @@ use std::{
 };
 
 #[allow(clippy::complexity)]
-struct Callback(Box<dyn FnMut(&mut [f32], usize) + Send>);
+struct UserData {
+    callback: Box<dyn FnMut(&mut [f32], usize) + Send>,
+}
 
 pub struct CoreAudioBackend {
     device: AudioDeviceID,
     device_info: DeviceInfo,
     output_channel_count: usize,
     audio_io_proc: Option<AudioDeviceIOProcID>,
-    callback: Option<*mut Callback>,
+    callback: Option<*mut UserData>,
 }
 
 impl CoreAudioBackend {
@@ -331,7 +333,7 @@ impl Backend for CoreAudioBackend {
     fn start(&mut self, callback: Box<AudioCallback>) -> Result<(), StartBackendError> {
         self.stop();
 
-        let callback = Box::new(Callback(callback));
+        let callback = Box::new(UserData { callback });
         let callback = Box::into_raw(callback);
 
         let mut proc_id = MaybeUninit::<AudioDeviceIOProcID>::uninit();
@@ -402,8 +404,8 @@ unsafe extern "C" fn audio_io_proc(
         unsafe { slice::from_raw_parts_mut(ptr, list.mNumberBuffers as usize) }
     };
 
-    let callback = user_data.cast::<Callback>();
-    let callback = unsafe { callback.as_mut() }.unwrap();
+    let user_data = user_data.cast::<UserData>();
+    let user_data = unsafe { user_data.as_mut() }.unwrap();
 
     let channels = {
         let data = output_buffers[0].mData.cast::<f32>();
@@ -411,7 +413,7 @@ unsafe extern "C" fn audio_io_proc(
         unsafe { slice::from_raw_parts_mut(data, len) }
     };
 
-    callback.0(
+    (user_data.callback)(
         channels,
         channels.len() / output_buffers[0].mNumberChannels as usize,
     );
