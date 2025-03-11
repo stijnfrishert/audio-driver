@@ -14,7 +14,7 @@ pub trait Backend: Sized + Send + Sync {
     fn configuration(&self) -> Configuration;
 
     /// Start the audio callback
-    fn start(&mut self, callback: Box<AudioCallback>) -> Result<(), StartError>;
+    fn start(&mut self, callback: Box<AudioCallback>) -> Result<(), StartBackendError>;
 
     /// Stop the audio callback
     fn stop(&mut self);
@@ -64,4 +64,4 @@ pub enum ConfigureError {
 
 #[derive(Debug, Error)]
 #[error("The device could not be started")]
-pub struct StartError;
+pub struct StartBackendError;
