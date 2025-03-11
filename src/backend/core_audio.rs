@@ -1,4 +1,6 @@
-use super::{AudioCallback, Backend, Configuration, ConfigureError, NewBackendError, StartError};
+use super::{
+    AudioCallback, Backend, Configuration, ConfigureError, NewBackendError, StartBackendError,
+};
 use coreaudio::sys::{
     self, AudioBuffer, AudioBufferList, AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID,
     AudioDeviceID, AudioDeviceIOProcID, AudioDeviceStart, AudioObjectGetPropertyData,
@@ -326,7 +328,7 @@ impl Backend for CoreAudioBackend {
         }
     }
 
-    fn start(&mut self, callback: Box<AudioCallback>) -> Result<(), StartError> {
+    fn start(&mut self, callback: Box<AudioCallback>) -> Result<(), StartBackendError> {
         self.stop();
 
         let callback = Box::new(Callback(callback));
@@ -359,7 +361,7 @@ impl Backend for CoreAudioBackend {
                 let _ = coreaudio::Error::from_os_status(unsafe {
                     AudioDeviceDestroyIOProcID(self.device, proc_id)
                 });
-                Err(StartError)
+                Err(StartBackendError)
             }
         }
     }
