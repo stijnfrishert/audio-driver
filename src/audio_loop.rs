@@ -1,8 +1,12 @@
 use crate::backend::{Backend, Configuration, NewBackendError, StartBackendError};
+use rtrb::RingBuffer;
 use std::{
-    sync::mpsc::{SendError, SyncSender, sync_channel},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{SendError, SyncSender, sync_channel},
+    },
     thread,
-    time::Duration,
 };
 use thiserror::Error;
 
@@ -19,13 +23,12 @@ where
     /// This allows the audio processing to run on a separate thread
     command_sender: SyncSender<R::Command>,
 
-    /// The sender that will be used to send updates out of the audio thread
-    /// This is an option, because we will take it when dropping the audio loop
-    update_sender: Option<SyncSender<R::Update>>,
-
     /// A handle to the thread receiving updates coming from the audio thread
     /// This is an option, because we will take it when dropping the audio loop
     update_thread: Option<thread::JoinHandle<()>>,
+
+    /// A flag to signal whether we're running or not
+    running: Arc<AtomicBool>,
 }
 
 impl<B, R> AudioLoop<B, R>
@@ -55,28 +58,40 @@ where
         let (command_sender, command_receiver) = sync_channel(command_count);
 
         // Create send/receive pairs for outgoing updates
-        let (update_sender, update_receiver) = sync_channel(update_count);
+        let (mut update_sender, mut update_receiver) = RingBuffer::new(update_count);
+
+        let running = Arc::new(AtomicBool::new(true));
 
         // Start the backend and run the audio loop
         backend.start(Box::new({
-            let update_sender = update_sender.clone();
             move |output, len| {
                 // Handle the messages
                 while let Ok(command) = command_receiver.try_recv() {
-                    runner.handle_command(command, &update_sender);
+                    runner.handle_command(command, |update| {
+                        let _ = update_sender.push(update);
+                    });
                 }
 
-                runner.run(output, len, &update_sender);
+                runner.run(output, len, |update| {
+                    let _ = update_sender.push(update);
+                });
             }
         }))?;
 
         // Start a thread to receive updates
         let update_thread = thread::spawn({
+            let running = Arc::clone(&running);
             move || {
-                while let Ok(update) = update_receiver.recv() {
-                    on_update(update);
+                loop {
+                    for update in update_receiver.read_chunk(update_receiver.slots()).unwrap() {
+                        on_update(update);
+                    }
 
-                    thread::sleep(Duration::from_millis(10));
+                    if running.load(Ordering::SeqCst) {
+                        thread::yield_now();
+                    } else {
+                        break;
+                    }
                 }
             }
         });
@@ -84,8 +99,8 @@ where
         Ok(Self {
             backend,
             command_sender,
-            update_sender: Some(update_sender),
             update_thread: Some(update_thread),
+            running,
         })
     }
 
@@ -121,7 +136,7 @@ where
         self.backend.stop();
 
         // Drop the sender, which will close the channel
-        drop(self.update_sender.take());
+        self.running.store(false, Ordering::SeqCst);
 
         // Join the thread
         self.update_thread.take().unwrap().join().unwrap();
@@ -141,10 +156,10 @@ pub trait Runner: Send {
     type Update: Send + 'static;
 
     /// Handle a command that was sent to the runner
-    fn handle_command(&mut self, command: Self::Command, on_update: &SyncSender<Self::Update>);
+    fn handle_command(&mut self, command: Self::Command, on_update: impl FnMut(Self::Update));
 
     /// Process audio and send out updates if need be
-    fn run(&mut self, output: &mut [f32], len: usize, on_update: &SyncSender<Self::Update>);
+    fn run(&mut self, output: &mut [f32], len: usize, on_update: impl FnMut(Self::Update));
 }
 
 /// An error that can occur when creating a new audio loop
