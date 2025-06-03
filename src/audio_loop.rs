@@ -4,7 +4,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{SendError, SyncSender, sync_channel},
+        mpsc::{SendError, Sender, channel},
     },
     thread,
 };
@@ -21,7 +21,7 @@ where
 
     /// The sender for incoming commands.
     /// This allows the audio processing to run on a separate thread
-    command_sender: SyncSender<R::Command>,
+    command_sender: Sender<R::Command>,
 
     /// A handle to the thread receiving updates coming from the audio thread
     /// This is an option, because we will take it when dropping the audio loop
@@ -40,13 +40,11 @@ where
     ///
     /// # Parameters
     /// - `configuration`: The configuration to initialize the backend with
-    /// - `command_count`: The number of commands that can be buffered
     /// - `update_count`: The number of updates that can be buffered
     /// - `runner`: The runner that will process the audio loop and handle commands
     /// - `on_update`: A closure that will be called with updates coming from the audio loop
     pub fn new(
         configuration: Configuration,
-        command_count: usize,
         update_count: usize,
         mut runner: R,
         mut on_update: impl FnMut(R::Update) + Send + 'static,
@@ -55,7 +53,7 @@ where
         let mut backend = B::new(configuration)?;
 
         // Create a send/receive pair for the incoming commands
-        let (command_sender, command_receiver) = sync_channel(command_count);
+        let (command_sender, command_receiver) = channel();
 
         // Create send/receive pairs for outgoing updates
         let (mut update_sender, mut update_receiver) = RingBuffer::new(update_count);
