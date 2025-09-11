@@ -79,9 +79,15 @@ where
         // Start a thread to receive updates
         let update_thread = thread::spawn({
             let running = Arc::clone(&running);
+
+            let mut updates = Vec::with_capacity(update_count);
             move || {
                 loop {
                     for update in update_receiver.read_chunk(update_receiver.slots()).unwrap() {
+                        updates.push(update);
+                    }
+
+                    for update in updates.drain(..) {
                         on_update(update);
                     }
 
