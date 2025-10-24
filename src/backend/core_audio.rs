@@ -1,5 +1,6 @@
 use super::{
-    AudioCallback, Backend, Configuration, ConfigureError, NewBackendError, StartBackendError,
+    AudioCallback, Backend, Configuration, ConfigureError, Layout, NewBackendError,
+    StartBackendError,
 };
 use coreaudio::sys::{
     self, AudioBuffer, AudioBufferList, AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID,
@@ -16,7 +17,7 @@ use std::{
 
 #[allow(clippy::complexity)]
 struct UserData {
-    callback: Box<dyn FnMut(&mut [f32], usize) + Send>,
+    callback: Box<dyn FnMut(&mut [f32], Layout, usize) + Send>,
 }
 
 pub struct CoreAudioBackend {
@@ -415,6 +416,7 @@ unsafe extern "C" fn audio_io_proc(
 
     (user_data.callback)(
         channels,
+        Layout::Interleaved,
         channels.len() / output_buffers[0].mNumberChannels as usize,
     );
 

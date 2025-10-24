@@ -1,4 +1,4 @@
-use crate::backend::{Backend, Configuration, NewBackendError, StartBackendError};
+use crate::backend::{Backend, Configuration, Layout, NewBackendError, StartBackendError};
 use rtrb::RingBuffer;
 use std::{
     sync::{
@@ -62,7 +62,7 @@ where
 
         // Start the backend and run the audio loop
         backend.start(Box::new({
-            move |output, len| {
+            move |output, layout, len| {
                 // Handle the messages
                 while let Ok(command) = command_receiver.try_recv() {
                     runner.handle_command(command, |update| {
@@ -70,7 +70,7 @@ where
                     });
                 }
 
-                runner.run(output, len, |update| {
+                runner.run(output, layout, len, |update| {
                     let _ = update_sender.push(update);
                 });
             }
@@ -163,7 +163,13 @@ pub trait Runner: Send {
     fn handle_command(&mut self, command: Self::Command, on_update: impl FnMut(Self::Update));
 
     /// Process audio and send out updates if need be
-    fn run(&mut self, output: &mut [f32], len: usize, on_update: impl FnMut(Self::Update));
+    fn run(
+        &mut self,
+        output: &mut [f32],
+        layout: Layout,
+        len: usize,
+        on_update: impl FnMut(Self::Update),
+    );
 }
 
 /// An error that can occur when creating a new audio loop
