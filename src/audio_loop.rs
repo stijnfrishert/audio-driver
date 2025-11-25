@@ -1,8 +1,9 @@
 use crate::backend::{Backend, Configuration, Layout, NewBackendError, StartBackendError};
 use rtrb::RingBuffer;
 use std::{
+    collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{SendError, Sender, channel},
     },
@@ -29,6 +30,36 @@ where
 
     /// A flag to signal whether we're running or not
     running: Arc<AtomicBool>,
+
+    /// The subscribers for updates coming from the audio loop
+    subscribers: Arc<Mutex<SubscriptionMap<R::Update>>>,
+}
+
+type SubscriberFn<T> = Box<dyn FnMut(&T) + Send>;
+
+struct SubscriptionMap<T> {
+    map: HashMap<u64, SubscriberFn<T>>,
+    next_key: u64,
+}
+
+impl<T> SubscriptionMap<T> {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            next_key: 0,
+        }
+    }
+
+    pub fn insert(&mut self, callback: SubscriberFn<T>) -> u64 {
+        let key = self.next_key;
+        self.next_key += 1;
+        self.map.insert(key, callback);
+        key
+    }
+
+    pub fn remove(&mut self, key: u64) -> bool {
+        self.map.remove(&key).is_some()
+    }
 }
 
 impl<B, R> AudioLoop<B, R>
@@ -42,12 +73,10 @@ where
     /// - `configuration`: The configuration to initialize the backend with
     /// - `update_count`: The number of updates that can be buffered
     /// - `runner`: The runner that will process the audio loop and handle commands
-    /// - `on_update`: A closure that will be called with updates coming from the audio loop
     pub fn new(
         configuration: Configuration,
         update_count: usize,
         mut runner: R,
-        mut on_update: impl FnMut(R::Update) + Send + 'static,
     ) -> Result<Self, AudioLoopNewError> {
         // Create the backend that will run the audio loop
         let mut backend = B::new(configuration)?;
@@ -77,8 +106,10 @@ where
         }))?;
 
         // Start a thread to receive updates
+        let subscribers = Arc::new(Mutex::new(SubscriptionMap::<R::Update>::new()));
         let update_thread = thread::spawn({
             let running = Arc::clone(&running);
+            let subscribers = Arc::clone(&subscribers);
 
             let mut updates = Vec::with_capacity(update_count);
             move || {
@@ -88,7 +119,9 @@ where
                     }
 
                     for update in updates.drain(..) {
-                        on_update(update);
+                        for subscriber in subscribers.lock().unwrap().map.values_mut() {
+                            subscriber(&update);
+                        }
                     }
 
                     if running.load(Ordering::SeqCst) {
@@ -105,6 +138,7 @@ where
             command_sender,
             update_thread: Some(update_thread),
             running,
+            subscribers,
         })
     }
 
@@ -126,6 +160,20 @@ where
     /// Send a command to the runner in the audio loop
     pub fn send_command(&self, command: R::Command) -> Result<(), SendError<R::Command>> {
         self.command_sender.send(command)
+    }
+
+    /// Register a listener for updates coming from the audio loop
+    pub fn subscribe<F>(&self, callback: F) -> Subscription
+    where
+        F: FnMut(&R::Update) + Send + 'static,
+    {
+        let id = self.subscribers.lock().unwrap().insert(Box::new(callback));
+        Subscription(id)
+    }
+
+    /// Unregister a listener for updates coming from the audio loop
+    pub fn unsubscribe(&self, subscription: Subscription) -> bool {
+        self.subscribers.lock().unwrap().remove(subscription.0)
     }
 }
 
@@ -181,3 +229,5 @@ pub enum AudioLoopNewError {
     #[error("The audio callback could not be started")]
     StartBackend(#[from] StartBackendError),
 }
+
+pub struct Subscription(u64);
