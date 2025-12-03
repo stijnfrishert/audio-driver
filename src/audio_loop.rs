@@ -1,4 +1,4 @@
-use crate::backend::{Backend, Configuration, Layout, NewBackendError, StartBackendError};
+use crate::backend::{Backend, Layout, StartBackendError};
 use rtrb::RingBuffer;
 use std::{
     collections::HashMap,
@@ -70,17 +70,13 @@ where
     /// Create a new audio loop and start running it
     ///
     /// # Parameters
-    /// - `configuration`: The configuration to initialize the backend with
     /// - `update_count`: The number of updates that can be buffered
     /// - `runner`: The runner that will process the audio loop and handle commands
     pub fn new(
-        configuration: Configuration,
+        mut backend: B,
         update_count: usize,
         mut runner: R,
     ) -> Result<Self, AudioLoopNewError> {
-        // Create the backend that will run the audio loop
-        let mut backend = B::new(configuration)?;
-
         // Create a send/receive pair for the incoming commands
         let (command_sender, command_receiver) = channel();
 
@@ -223,9 +219,6 @@ pub trait Runner: Send {
 /// An error that can occur when creating a new audio loop
 #[derive(Debug, Error)]
 pub enum AudioLoopNewError {
-    #[error("The backend could not be created")]
-    NewBackend(#[from] NewBackendError),
-
     #[error("The audio callback could not be started")]
     StartBackend(#[from] StartBackendError),
 }
