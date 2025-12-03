@@ -7,6 +7,9 @@ pub trait Backend: Sized + Send + Sync {
     /// Construct a new audio backend
     fn new(configuration: Configuration) -> Result<Self, NewBackendError>;
 
+    /// Query for the default configuration (for the default device)
+    fn new_with_default_configuration() -> Result<Self, NewBackendError>;
+
     /// Configure the settings to use for the audio callback
     fn configure(&mut self, configuration: Configuration) -> Result<(), ConfigureError>;
 

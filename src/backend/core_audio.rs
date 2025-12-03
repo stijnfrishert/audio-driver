@@ -271,6 +271,38 @@ impl Backend for CoreAudioBackend {
         })
     }
 
+    fn new_with_default_configuration() -> Result<Self, NewBackendError> {
+        let device = Self::default_device(false).map_err(|_| NewBackendError::NoDefaultDevice)?;
+
+        let device_info = Self::get_device_info(device, false).unwrap();
+
+        let sample_rate = Self::get_property_data::<f64>(
+            device,
+            &AudioObjectPropertyAddress {
+                mSelector: sys::kAudioDevicePropertyNominalSampleRate,
+                mScope: sys::kAudioObjectPropertyScopeWildcard,
+                mElement: sys::kAudioObjectPropertyElementMain,
+            },
+        )
+        .unwrap() as u32;
+
+        let buffer_size = Self::get_property_data::<u32>(
+            device,
+            &AudioObjectPropertyAddress {
+                mSelector: sys::kAudioDevicePropertyBufferFrameSize,
+                mScope: sys::kAudioObjectPropertyScopeWildcard,
+                mElement: sys::kAudioObjectPropertyElementMain,
+            },
+        )
+        .unwrap() as usize;
+
+        Self::new(Configuration {
+            channel_count: device_info.max_channel_count,
+            sample_rate,
+            buffer_size,
+        })
+    }
+
     fn configure(&mut self, configuration: Configuration) -> Result<(), ConfigureError> {
         if self.has_started() {
             Err(ConfigureError::AlreadyStarted)
