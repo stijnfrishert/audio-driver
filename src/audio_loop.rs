@@ -186,8 +186,8 @@ where
         // Drop the sender, which will close the channel
         self.running.store(false, Ordering::SeqCst);
 
-        // Join the thread
-        self.update_thread.take().unwrap().join().unwrap();
+        // Join the thread (ignore errors if thread panicked)
+        let _ = self.update_thread.take().map(|t| t.join());
     }
 }
 
