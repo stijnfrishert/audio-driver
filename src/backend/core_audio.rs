@@ -370,15 +370,20 @@ impl Backend for CoreAudioBackend {
         let callback = Box::into_raw(callback);
 
         let mut proc_id = MaybeUninit::<AudioDeviceIOProcID>::uninit();
-        coreaudio::Error::from_os_status(unsafe {
+        let result = coreaudio::Error::from_os_status(unsafe {
             AudioDeviceCreateIOProcID(
                 self.device,
                 Some(audio_io_proc),
                 callback as *mut c_void,
                 proc_id.as_mut_ptr(),
             )
-        })
-        .unwrap();
+        });
+
+        if result.is_err() {
+            // Clean up the callback before returning
+            let _ = unsafe { Box::from_raw(callback) };
+            return Err(StartBackendError);
+        }
 
         self.callback = Some(callback);
 
