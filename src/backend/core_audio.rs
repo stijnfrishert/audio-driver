@@ -23,7 +23,7 @@ struct UserData {
 pub struct CoreAudioBackend {
     device: AudioDeviceID,
     device_info: DeviceInfo,
-    output_channel_count: usize,
+    configuration: Configuration,
     audio_io_proc: Option<AudioDeviceIOProcID>,
     callback: Option<*mut UserData>,
 }
@@ -215,6 +215,32 @@ impl CoreAudioBackend {
             )
         })
     }
+
+    fn query_configuration(device: AudioDeviceID, channel_count: usize) -> Result<Configuration, coreaudio::Error> {
+        let sample_rate = Self::get_property_data::<f64>(
+            device,
+            &AudioObjectPropertyAddress {
+                mSelector: sys::kAudioDevicePropertyNominalSampleRate,
+                mScope: sys::kAudioObjectPropertyScopeWildcard,
+                mElement: sys::kAudioObjectPropertyElementMain,
+            },
+        )? as u32;
+
+        let buffer_size = Self::get_property_data::<u32>(
+            device,
+            &AudioObjectPropertyAddress {
+                mSelector: sys::kAudioDevicePropertyBufferFrameSize,
+                mScope: sys::kAudioObjectPropertyScopeWildcard,
+                mElement: sys::kAudioObjectPropertyElementMain,
+            },
+        )? as usize;
+
+        Ok(Configuration {
+            channel_count,
+            sample_rate,
+            buffer_size,
+        })
+    }
 }
 
 unsafe impl Send for CoreAudioBackend {}
@@ -233,7 +259,8 @@ impl Backend for CoreAudioBackend {
         let device = Self::default_device(false).map_err(|_| NewBackendError::NoDefaultDevice)?;
 
         // Retrieve the available settings for this device, and check if it supports out configuration
-        let device_info = Self::get_device_info(device, false).unwrap();
+        let device_info =
+            Self::get_device_info(device, false).map_err(|_| NewBackendError::DeviceQueryFailed)?;
 
         if !device_info.supports(&configuration) {
             return Err(NewBackendError::UnsupportedConfiguration);
@@ -249,7 +276,7 @@ impl Backend for CoreAudioBackend {
             },
             &(configuration.sample_rate as f64),
         )
-        .unwrap();
+        .map_err(|_| NewBackendError::DeviceQueryFailed)?;
 
         Self::set_property_data(
             device,
@@ -260,12 +287,16 @@ impl Backend for CoreAudioBackend {
             },
             &(configuration.buffer_size as u32),
         )
-        .unwrap();
+        .map_err(|_| NewBackendError::DeviceQueryFailed)?;
+
+        // Query the actual configuration - the device may not have honored our request exactly
+        let configuration = Self::query_configuration(device, configuration.channel_count)
+            .map_err(|_| NewBackendError::DeviceQueryFailed)?;
 
         Ok(Self {
             device,
             device_info,
-            output_channel_count: configuration.channel_count,
+            configuration,
             audio_io_proc: None,
             callback: None,
         })
@@ -274,93 +305,61 @@ impl Backend for CoreAudioBackend {
     fn new_with_default_configuration() -> Result<Self, NewBackendError> {
         let device = Self::default_device(false).map_err(|_| NewBackendError::NoDefaultDevice)?;
 
-        let device_info = Self::get_device_info(device, false).unwrap();
+        let device_info =
+            Self::get_device_info(device, false).map_err(|_| NewBackendError::DeviceQueryFailed)?;
 
-        let sample_rate = Self::get_property_data::<f64>(
+        let configuration =
+            Self::query_configuration(device, device_info.max_channel_count)
+                .map_err(|_| NewBackendError::DeviceQueryFailed)?;
+
+        Ok(Self {
             device,
-            &AudioObjectPropertyAddress {
-                mSelector: sys::kAudioDevicePropertyNominalSampleRate,
-                mScope: sys::kAudioObjectPropertyScopeWildcard,
-                mElement: sys::kAudioObjectPropertyElementMain,
-            },
-        )
-        .unwrap() as u32;
-
-        let buffer_size = Self::get_property_data::<u32>(
-            device,
-            &AudioObjectPropertyAddress {
-                mSelector: sys::kAudioDevicePropertyBufferFrameSize,
-                mScope: sys::kAudioObjectPropertyScopeWildcard,
-                mElement: sys::kAudioObjectPropertyElementMain,
-            },
-        )
-        .unwrap() as usize;
-
-        Self::new(Configuration {
-            channel_count: device_info.max_channel_count,
-            sample_rate,
-            buffer_size,
+            device_info,
+            configuration,
+            audio_io_proc: None,
+            callback: None,
         })
     }
 
     fn configure(&mut self, configuration: Configuration) -> Result<(), ConfigureError> {
         if self.has_started() {
-            Err(ConfigureError::AlreadyStarted)
-        } else if self.device_info.supports(&configuration) {
-            Self::set_property_data(
-                self.device,
-                &AudioObjectPropertyAddress {
-                    mSelector: sys::kAudioDevicePropertyNominalSampleRate,
-                    mScope: sys::kAudioObjectPropertyScopeWildcard,
-                    mElement: sys::kAudioObjectPropertyElementMain,
-                },
-                &(configuration.sample_rate as f64),
-            )
-            .unwrap();
-
-            Self::set_property_data(
-                self.device,
-                &AudioObjectPropertyAddress {
-                    mSelector: sys::kAudioDevicePropertyBufferFrameSize,
-                    mScope: sys::kAudioObjectPropertyScopeWildcard,
-                    mElement: sys::kAudioObjectPropertyElementMain,
-                },
-                &(configuration.buffer_size as u32),
-            )
-            .unwrap();
-
-            Ok(())
-        } else {
-            Err(ConfigureError::UnsupportedConfiguration)
+            return Err(ConfigureError::AlreadyStarted);
         }
-    }
 
-    fn configuration(&self) -> Configuration {
-        let sample_rate = Self::get_property_data::<f64>(
+        if !self.device_info.supports(&configuration) {
+            return Err(ConfigureError::UnsupportedConfiguration);
+        }
+
+        Self::set_property_data(
             self.device,
             &AudioObjectPropertyAddress {
                 mSelector: sys::kAudioDevicePropertyNominalSampleRate,
                 mScope: sys::kAudioObjectPropertyScopeWildcard,
                 mElement: sys::kAudioObjectPropertyElementMain,
             },
+            &(configuration.sample_rate as f64),
         )
-        .unwrap() as u32;
+        .map_err(|_| ConfigureError::DeviceConfigureFailed)?;
 
-        let buffer_size = Self::get_property_data::<u32>(
+        Self::set_property_data(
             self.device,
             &AudioObjectPropertyAddress {
                 mSelector: sys::kAudioDevicePropertyBufferFrameSize,
                 mScope: sys::kAudioObjectPropertyScopeWildcard,
                 mElement: sys::kAudioObjectPropertyElementMain,
             },
+            &(configuration.buffer_size as u32),
         )
-        .unwrap() as usize;
+        .map_err(|_| ConfigureError::DeviceConfigureFailed)?;
 
-        Configuration {
-            channel_count: self.output_channel_count,
-            sample_rate,
-            buffer_size,
-        }
+        // Query the actual configuration - the device may not have honored our request exactly
+        self.configuration = Self::query_configuration(self.device, configuration.channel_count)
+            .map_err(|_| ConfigureError::DeviceConfigureFailed)?;
+        Ok(())
+    }
+
+    fn configuration(&self) -> Configuration {
+        self.configuration
     }
 
     fn start(&mut self, callback: Box<AudioCallback>) -> Result<(), StartBackendError> {

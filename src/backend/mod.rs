@@ -125,6 +125,9 @@ pub enum NewBackendError {
     #[error("Could not find the default output device")]
     NoDefaultDevice,
 
+    #[error("Failed to query device properties")]
+    DeviceQueryFailed,
+
     #[error("The provided configuration was not supported")]
     UnsupportedConfiguration,
 }
@@ -133,6 +136,9 @@ pub enum NewBackendError {
 pub enum ConfigureError {
     #[error("The audio callback has already started. You need to stop it first.")]
     AlreadyStarted,
+
+    #[error("Failed to set device properties")]
+    DeviceConfigureFailed,
 
     #[error("The provided configuration is not supported")]
     UnsupportedConfiguration,
