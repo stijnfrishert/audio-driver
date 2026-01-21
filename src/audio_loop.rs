@@ -26,7 +26,10 @@ where
 
     /// A handle to the thread receiving updates coming from the audio thread
     /// This is an option, because we will take it when dropping the audio loop
-    update_thread: Option<thread::JoinHandle<()>>,
+    update_join_handle: Option<thread::JoinHandle<()>>,
+
+    /// Handle to unpark the update thread
+    update_thread: thread::Thread,
 
     /// A flag to signal whether we're running or not
     running: Arc<AtomicBool>,
@@ -85,7 +88,51 @@ where
 
         let running = Arc::new(AtomicBool::new(true));
 
+        // Start a thread to receive updates (must be created before starting the backend
+        // so we can pass its handle to the audio callback for unparking)
+        let subscribers = Arc::new(Mutex::new(SubscriptionMap::<R::Update>::new()));
+        let update_join_handle_running = Arc::clone(&running);
+        let update_join_handle_subscribers = Arc::clone(&subscribers);
+        let (update_join_handle, update_thread) = {
+            // Channel to pass the thread handle to itself
+            let (tx, rx) = std::sync::mpsc::sync_channel::<thread::Thread>(1);
+
+            let handle = thread::spawn({
+                let mut updates = Vec::with_capacity(update_count);
+                move || {
+                    // Get our own thread handle
+                    let _self_handle = rx.recv().unwrap();
+
+                    loop {
+                        // Read all available updates
+                        for update in update_receiver.read_chunk(update_receiver.slots()).unwrap() {
+                            updates.push(update);
+                        }
+
+                        // Dispatch updates to subscribers
+                        for update in updates.drain(..) {
+                            for subscriber in update_join_handle_subscribers.lock().unwrap().map.values_mut() {
+                                subscriber(&update);
+                            }
+                        }
+
+                        if update_join_handle_running.load(Ordering::SeqCst) {
+                            // Park until woken by the audio callback or shutdown
+                            thread::park();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let thread_handle = handle.thread().clone();
+            tx.send(thread_handle.clone()).unwrap();
+            (handle, thread_handle)
+        };
+
         // Start the backend and run the audio loop
+        let callback_thread_handle = update_thread.clone();
         backend.start(Box::new({
             move |output, layout, len| {
                 // Handle the messages
@@ -98,41 +145,17 @@ where
                 runner.run(output, layout, len, |update| {
                     let _ = update_sender.push(update);
                 });
+
+                // Wake the update thread to process any new updates
+                callback_thread_handle.unpark();
             }
         }))?;
-
-        // Start a thread to receive updates
-        let subscribers = Arc::new(Mutex::new(SubscriptionMap::<R::Update>::new()));
-        let update_thread = thread::spawn({
-            let running = Arc::clone(&running);
-            let subscribers = Arc::clone(&subscribers);
-
-            let mut updates = Vec::with_capacity(update_count);
-            move || {
-                loop {
-                    for update in update_receiver.read_chunk(update_receiver.slots()).unwrap() {
-                        updates.push(update);
-                    }
-
-                    for update in updates.drain(..) {
-                        for subscriber in subscribers.lock().unwrap().map.values_mut() {
-                            subscriber(&update);
-                        }
-                    }
-
-                    if running.load(Ordering::SeqCst) {
-                        thread::yield_now();
-                    } else {
-                        break;
-                    }
-                }
-            }
-        });
 
         Ok(Self {
             backend,
             command_sender,
-            update_thread: Some(update_thread),
+            update_join_handle: Some(update_join_handle),
+            update_thread,
             running,
             subscribers,
         })
@@ -158,7 +181,10 @@ where
         self.command_sender.send(command)
     }
 
-    /// Register a listener for updates coming from the audio loop
+    /// Register a listener for updates coming from the audio loop.
+    ///
+    /// # Warning
+    /// The callback must not call `subscribe` or `unsubscribe` - doing so will deadlock.
     pub fn subscribe<F>(&self, callback: F) -> Subscription
     where
         F: FnMut(&R::Update) + Send + 'static,
@@ -167,7 +193,10 @@ where
         Subscription(id)
     }
 
-    /// Unregister a listener for updates coming from the audio loop
+    /// Unregister a listener for updates coming from the audio loop.
+    ///
+    /// # Warning
+    /// Must not be called from within a subscriber callback - doing so will deadlock.
     pub fn unsubscribe(&self, subscription: Subscription) -> bool {
         self.subscribers.lock().unwrap().remove(subscription.0)
     }
@@ -183,11 +212,12 @@ where
         // This stops it from sending new messages as well
         self.backend.stop();
 
-        // Drop the sender, which will close the channel
+        // Signal shutdown and wake the update thread so it can exit
         self.running.store(false, Ordering::SeqCst);
+        self.update_thread.unpark();
 
         // Join the thread (ignore errors if thread panicked)
-        let _ = self.update_thread.take().map(|t| t.join());
+        let _ = self.update_join_handle.take().map(|t| t.join());
     }
 }
 
