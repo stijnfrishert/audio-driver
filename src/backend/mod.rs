@@ -1,41 +1,19 @@
-use thiserror::Error;
-
-#[cfg(target_os = "macos")]
-pub mod core_audio;
-
-pub trait Backend: Sized + Send + Sync {
-    /// Construct a new audio backend
-    fn new(configuration: Configuration) -> Result<Self, NewBackendError>;
-
-    /// Query for the default configuration (for the default device)
-    fn new_with_default_configuration() -> Result<Self, NewBackendError>;
-
-    /// Configure the settings to use for the audio callback
-    fn configure(&mut self, configuration: Configuration) -> Result<(), ConfigureError>;
-
-    /// Retrieve the settings used for the audio callback
-    fn configuration(&self) -> Configuration;
-
-    /// Start the audio callback
-    fn start(&mut self, callback: Box<AudioCallback>) -> Result<(), StartBackendError>;
-
-    /// Stop the audio callback
-    fn stop(&mut self);
-
-    /// Is the audio callback running
-    fn has_started(&self) -> bool;
-}
-
-/// The audio callback that will be called by the audio backend
-pub type AudioCallback = dyn FnMut(&mut [f32], Layout, usize) + Send + 'static;
-
+/// Buffer layout indicator for audio data
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
+    /// Samples are interleaved: [L0, R0, L1, R1, ...]
     Interleaved,
+    /// Samples are planar: [L0, L1, ..., R0, R1, ...]
     NonInterleaved,
 }
 
 impl Layout {
+    /// Convert non-interleaved (planar) data to interleaved format in-place
+    ///
+    /// # Arguments
+    /// * `buf` - The buffer to convert (modified in-place)
+    /// * `channels` - Number of audio channels
+    /// * `scratch` - A scratch buffer at least as large as `buf`
     pub fn interleave<T: Copy>(buf: &mut [T], channels: usize, scratch: &mut [T]) {
         assert!(channels > 0, "channels must be > 0");
 
@@ -70,6 +48,12 @@ impl Layout {
         buf.copy_from_slice(&scratch[..buf.len()]);
     }
 
+    /// Convert interleaved data to non-interleaved (planar) format in-place
+    ///
+    /// # Arguments
+    /// * `buf` - The buffer to convert (modified in-place)
+    /// * `channels` - Number of audio channels
+    /// * `scratch` - A scratch buffer at least as large as `buf`
     pub fn deinterleave<T: Copy>(buf: &mut [T], channels: usize, scratch: &mut [T]) {
         assert!(channels > 0, "channels must be > 0");
         if buf.is_empty() || channels == 1 {
@@ -101,52 +85,6 @@ impl Layout {
         buf.copy_from_slice(&scratch[..buf.len()]);
     }
 }
-
-/// Settings used for running an audio callback
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Configuration {
-    pub channel_count: usize,
-    pub sample_rate: u32,
-    pub buffer_size: usize,
-}
-
-impl Configuration {
-    pub fn new(channel_count: usize, sample_rate: u32, buffer_size: usize) -> Self {
-        Self {
-            channel_count,
-            sample_rate,
-            buffer_size,
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum NewBackendError {
-    #[error("Could not find the default output device")]
-    NoDefaultDevice,
-
-    #[error("Failed to query device properties")]
-    DeviceQueryFailed,
-
-    #[error("The provided configuration was not supported")]
-    UnsupportedConfiguration,
-}
-
-#[derive(Debug, Error)]
-pub enum ConfigureError {
-    #[error("The audio callback has already started. You need to stop it first.")]
-    AlreadyStarted,
-
-    #[error("Failed to set device properties")]
-    DeviceConfigureFailed,
-
-    #[error("The provided configuration is not supported")]
-    UnsupportedConfiguration,
-}
-
-#[derive(Debug, Error)]
-#[error("The device could not be started")]
-pub struct StartBackendError;
 
 #[cfg(test)]
 mod tests {

@@ -1,4 +1,6 @@
-use crate::backend::{Backend, Layout, StartBackendError};
+use crate::backend::Layout;
+use crate::device::{AudioDevice, StreamConfig};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use rtrb::RingBuffer;
 use std::{
     collections::HashMap,
@@ -12,13 +14,16 @@ use std::{
 use thiserror::Error;
 
 /// A running audio loop, plus the ability to send commands and receive updates
-pub struct AudioLoop<B, R>
+pub struct AudioLoop<R>
 where
-    B: Backend,
     R: Runner,
 {
-    /// The backend that drives the loop
-    backend: B,
+    /// The CPAL stream that drives the audio callback
+    #[allow(dead_code)]
+    stream: cpal::Stream,
+
+    /// The stream configuration
+    config: StreamConfig,
 
     /// The sender for incoming commands.
     /// This allows the audio processing to run on a separate thread
@@ -65,18 +70,20 @@ impl<T> SubscriptionMap<T> {
     }
 }
 
-impl<B, R> AudioLoop<B, R>
+impl<R> AudioLoop<R>
 where
-    B: Backend,
     R: Runner + 'static,
 {
     /// Create a new audio loop and start running it
     ///
     /// # Parameters
+    /// - `device`: The audio device to use
+    /// - `config`: The stream configuration
     /// - `update_count`: The number of updates that can be buffered
     /// - `runner`: The runner that will process the audio loop and handle commands
     pub fn new(
-        mut backend: B,
+        device: AudioDevice,
+        config: StreamConfig,
         update_count: usize,
         mut runner: R,
     ) -> Result<Self, AudioLoopNewError> {
@@ -111,7 +118,12 @@ where
 
                         // Dispatch updates to subscribers
                         for update in updates.drain(..) {
-                            for subscriber in update_join_handle_subscribers.lock().unwrap().map.values_mut() {
+                            for subscriber in update_join_handle_subscribers
+                                .lock()
+                                .unwrap()
+                                .map
+                                .values_mut()
+                            {
                                 subscriber(&update);
                             }
                         }
@@ -131,28 +143,46 @@ where
             (handle, thread_handle)
         };
 
-        // Start the backend and run the audio loop
+        // Build the CPAL stream
         let callback_thread_handle = update_thread.clone();
-        backend.start(Box::new({
-            move |output, layout, len| {
-                // Handle the messages
-                while let Ok(command) = command_receiver.try_recv() {
-                    runner.handle_command(command, |update| {
+        let channels = config.channels as usize;
+        let cpal_config: cpal::StreamConfig = (&config).into();
+
+        let stream = device
+            .inner()
+            .build_output_stream(
+                &cpal_config,
+                move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                    // Handle the messages
+                    while let Ok(command) = command_receiver.try_recv() {
+                        runner.handle_command(command, |update| {
+                            let _ = update_sender.push(update);
+                        });
+                    }
+
+                    let frames = data.len() / channels;
+                    runner.run(data, Layout::Interleaved, frames, |update| {
                         let _ = update_sender.push(update);
                     });
-                }
 
-                runner.run(output, layout, len, |update| {
-                    let _ = update_sender.push(update);
-                });
+                    // Wake the update thread to process any new updates
+                    callback_thread_handle.unpark();
+                },
+                |err| {
+                    eprintln!("Audio stream error: {}", err);
+                },
+                None,
+            )
+            .map_err(|e| AudioLoopNewError::BuildStream(e.to_string()))?;
 
-                // Wake the update thread to process any new updates
-                callback_thread_handle.unpark();
-            }
-        }))?;
+        // Start playing
+        stream
+            .play()
+            .map_err(|e| AudioLoopNewError::PlayStream(e.to_string()))?;
 
         Ok(Self {
-            backend,
+            stream,
+            config,
             command_sender,
             update_join_handle: Some(update_join_handle),
             update_thread,
@@ -163,17 +193,12 @@ where
 
     /// Retrieve the sample rate used by the audio loop
     pub fn sample_rate(&self) -> u32 {
-        self.backend.configuration().sample_rate
+        self.config.sample_rate
     }
 
     /// Retrieve the number of channels used by the audio loop
     pub fn channel_count(&self) -> usize {
-        self.backend.configuration().channel_count
-    }
-
-    /// Retrieve the buffer size used by the audio loop
-    pub fn buffer_size(&self) -> usize {
-        self.backend.configuration().buffer_size
+        self.config.channels as usize
     }
 
     /// Send a command to the runner in the audio loop
@@ -202,22 +227,19 @@ where
     }
 }
 
-impl<B, R> Drop for AudioLoop<B, R>
+impl<R> Drop for AudioLoop<R>
 where
-    B: Backend,
     R: Runner,
 {
     fn drop(&mut self) {
-        // Stop the backend itself
-        // This stops it from sending new messages as well
-        self.backend.stop();
-
         // Signal shutdown and wake the update thread so it can exit
         self.running.store(false, Ordering::SeqCst);
         self.update_thread.unpark();
 
         // Join the thread (ignore errors if thread panicked)
         let _ = self.update_join_handle.take().map(|t| t.join());
+
+        // Stream is dropped automatically, which stops playback
     }
 }
 
@@ -249,8 +271,11 @@ pub trait Runner: Send {
 /// An error that can occur when creating a new audio loop
 #[derive(Debug, Error)]
 pub enum AudioLoopNewError {
-    #[error("The audio callback could not be started")]
-    StartBackend(#[from] StartBackendError),
+    #[error("Failed to build audio stream: {0}")]
+    BuildStream(String),
+
+    #[error("Failed to start audio stream: {0}")]
+    PlayStream(String),
 }
 
 pub struct Subscription(u64);
