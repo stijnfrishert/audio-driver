@@ -1,15 +1,22 @@
 use cpal::traits::{DeviceTrait, HostTrait};
 use thiserror::Error;
 
+pub use cpal::{DeviceDescription, DeviceId};
+
 /// An audio device that can be used for playback or recording
 pub struct AudioDevice {
     inner: cpal::Device,
 }
 
 impl AudioDevice {
-    /// Get the name of this device
-    pub fn name(&self) -> Result<String, DeviceNameError> {
-        self.inner.name().map_err(|_| DeviceNameError)
+    /// Get the unique ID of this device
+    pub fn id(&self) -> Option<DeviceId> {
+        self.inner.id().ok()
+    }
+
+    /// Get the description of this device
+    pub fn description(&self) -> Option<DeviceDescription> {
+        self.inner.description().ok()
     }
 
     /// Get the supported output configurations for this device
@@ -101,12 +108,12 @@ impl SupportedStreamConfigRange {
 
     /// Get the minimum sample rate
     pub fn min_sample_rate(&self) -> u32 {
-        self.inner.min_sample_rate().0
+        self.inner.min_sample_rate()
     }
 
     /// Get the maximum sample rate
     pub fn max_sample_rate(&self) -> u32 {
-        self.inner.max_sample_rate().0
+        self.inner.max_sample_rate()
     }
 
     /// Get a config with a specific sample rate (clamped to supported range)
@@ -114,7 +121,7 @@ impl SupportedStreamConfigRange {
         let clamped = sample_rate
             .max(self.min_sample_rate())
             .min(self.max_sample_rate());
-        StreamConfig::from(self.inner.with_sample_rate(cpal::SampleRate(clamped)))
+        StreamConfig::from(self.inner.with_sample_rate(clamped))
     }
 }
 
@@ -133,7 +140,7 @@ impl From<cpal::StreamConfig> for StreamConfig {
     fn from(config: cpal::StreamConfig) -> Self {
         Self {
             channels: config.channels,
-            sample_rate: config.sample_rate.0,
+            sample_rate: config.sample_rate,
             buffer_size: match config.buffer_size {
                 cpal::BufferSize::Default => BufferSize::Default,
                 cpal::BufferSize::Fixed(size) => BufferSize::Fixed(size),
@@ -146,7 +153,7 @@ impl From<cpal::SupportedStreamConfig> for StreamConfig {
     fn from(config: cpal::SupportedStreamConfig) -> Self {
         Self {
             channels: config.channels(),
-            sample_rate: config.sample_rate().0,
+            sample_rate: config.sample_rate(),
             buffer_size: BufferSize::Default,
         }
     }
@@ -156,7 +163,7 @@ impl From<&StreamConfig> for cpal::StreamConfig {
     fn from(config: &StreamConfig) -> Self {
         cpal::StreamConfig {
             channels: config.channels,
-            sample_rate: cpal::SampleRate(config.sample_rate),
+            sample_rate: config.sample_rate,
             buffer_size: match config.buffer_size {
                 BufferSize::Default => cpal::BufferSize::Default,
                 BufferSize::Fixed(size) => cpal::BufferSize::Fixed(size),
@@ -192,10 +199,6 @@ pub fn default_output_device() -> Option<AudioDevice> {
 #[derive(Debug, Error)]
 #[error("Failed to enumerate audio devices")]
 pub struct EnumerateError;
-
-#[derive(Debug, Error)]
-#[error("Failed to get device name")]
-pub struct DeviceNameError;
 
 #[derive(Debug, Error)]
 #[error("Failed to get supported configurations")]
