@@ -67,7 +67,7 @@ enum StreamThreadMessage<C> {
     Stop,
 }
 
-type SubscriberFn<T> = Box<dyn FnMut(&T) + Send>;
+type SubscriberFn<T> = Box<dyn FnMut(&[T]) + Send>;
 
 struct SubscriptionMap<T> {
     map: HashMap<u64, SubscriberFn<T>>,
@@ -145,14 +145,17 @@ where
                             }
                         }
 
-                        // Dispatch updates to subscribers
+                        // Dispatch the whole drained batch to each subscriber in
+                        // a single call, so consumers can amortize per-update work.
                         if !updates.is_empty() {
-                            let mut subs = subscribers.lock().unwrap();
-                            for update in updates.drain(..) {
+                            {
+                                let mut subs = subscribers.lock().unwrap();
                                 for subscriber in subs.map.values_mut() {
-                                    subscriber(&update);
+                                    subscriber(&updates);
                                 }
                             }
+
+                            updates.clear();
                         }
 
                         // Park until woken by audio callback, start/stop, or shutdown
@@ -393,13 +396,14 @@ where
 
     /// Register a listener for updates coming from the audio loop.
     ///
-    /// Subscriptions persist across start/stop cycles.
+    /// The callback receives each wake-up's drained updates as a single batch,
+    /// in arrival order. Subscriptions persist across start/stop cycles.
     ///
     /// # Warning
     /// The callback must not call `subscribe` or `unsubscribe` - doing so will deadlock.
     pub fn subscribe<F>(&self, callback: F) -> Subscription
     where
-        F: FnMut(&R::Update) + Send + 'static,
+        F: FnMut(&[R::Update]) + Send + 'static,
     {
         let id = self
             .inner
