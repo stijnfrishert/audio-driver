@@ -10,6 +10,7 @@ use std::{
         mpsc::{Sender, channel},
     },
     thread,
+    time::Duration,
 };
 use thiserror::Error;
 
@@ -237,9 +238,11 @@ where
             // Create command channel for audio callback
             let (audio_cmd_tx, audio_cmd_rx) = channel();
 
+            let mut clock = FrameClock::new();
+
             let stream_result = device.inner().build_output_stream(
                 cpal_config,
-                move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     // Handle commands from audio command channel
                     while let Ok(command) = audio_cmd_rx.try_recv() {
                         runner.handle_command(command, |update| {
@@ -247,8 +250,11 @@ where
                         });
                     }
 
+                    debug_assert_eq!(data.len() % channels, 0, "partial frame in buffer");
                     let frames = data.len() / channels;
-                    runner.run(data, Layout::Interleaved, frames, |update| {
+                    let timing = clock.advance(frames, info.timestamp());
+
+                    runner.run(data, Layout::Interleaved, frames, timing, |update| {
                         let _ = update_sender.push(update);
                     });
 
@@ -471,6 +477,114 @@ where
     }
 }
 
+/// A monotonic instant on the audio stream's own clock.
+///
+/// Not an absolute epoch — on some platforms it begins at zero when the stream is created — so it is
+/// meaningful as a difference from another `StreamInstant`, not as a date. Each stream carries its
+/// own origin: instants from two streams, or from either side of a restart, don't share a clock and
+/// can't be compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StreamInstant {
+    inner: cpal::StreamInstant,
+}
+
+impl StreamInstant {
+    /// An instant `secs` seconds and `nanos` nanoseconds past the stream clock's origin.
+    ///
+    /// The origin is arbitrary, so this is mainly of use for building [`Timing`] values in tests.
+    pub fn new(secs: u64, nanos: u32) -> Self {
+        cpal::StreamInstant::new(secs, nanos).into()
+    }
+
+    /// The amount of time elapsed from an earlier instant to this one.
+    ///
+    /// Saturates to [`Duration::ZERO`] if `earlier` is actually later than `self`; use
+    /// [`Self::checked_duration_since`] to tell that case apart from a genuine zero.
+    pub fn duration_since(self, earlier: StreamInstant) -> Duration {
+        self.checked_duration_since(earlier).unwrap_or_default()
+    }
+
+    /// The amount of time elapsed from an earlier instant to this one.
+    ///
+    /// Returns `None` if `earlier` is actually later than `self`.
+    pub fn checked_duration_since(self, earlier: StreamInstant) -> Option<Duration> {
+        self.inner.checked_duration_since(earlier.inner)
+    }
+
+    /// The instant `duration` after this one.
+    ///
+    /// Returns `None` if the result falls outside the range the clock can represent.
+    pub fn checked_add(self, duration: Duration) -> Option<Self> {
+        self.inner.checked_add(duration).map(Self::from)
+    }
+
+    /// The instant `duration` before this one.
+    ///
+    /// Returns `None` if the result falls outside the range the clock can represent.
+    pub fn checked_sub(self, duration: Duration) -> Option<Self> {
+        self.inner.checked_sub(duration).map(Self::from)
+    }
+}
+
+impl From<cpal::StreamInstant> for StreamInstant {
+    fn from(inner: cpal::StreamInstant) -> Self {
+        Self { inner }
+    }
+}
+
+/// Where a callback's buffer sits in time.
+///
+/// The frame index is the stream's own timeline: it starts at zero when the stream starts and counts
+/// every frame handed to the runner, so a caller that needs to place events at absolute positions can
+/// do so without keeping its own count. **It resets on restart** — `stop()` followed by `start()` is a
+/// new timeline, not a continuation of the old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Timing {
+    /// Index of the first frame of this buffer, counted from the start of the stream.
+    ///
+    /// This counts frames the runner was handed, not frames the device consumed. The two agree until
+    /// the stream drops a callback, after which the frame index trails the audio clock by the dropped
+    /// frames for the rest of the stream. Use it to place events against one another, not to convert
+    /// between frames and instants.
+    pub frame: u64,
+
+    /// The instant this callback was invoked.
+    pub callback: StreamInstant,
+
+    /// The predicted instant this buffer reaches the device.
+    ///
+    /// This, not [`Self::callback`], is the one to timestamp a sound against. But backends derive it
+    /// rather than measure it, and differ in what they fold in: some add a single buffer to the
+    /// callback instant, leaving out whatever latency the hardware adds after that. It is a stable
+    /// reference for *when* a buffer sounds relative to another, not an absolute measure of how late
+    /// it sounds — that needs a round-trip calibration.
+    pub playback: StreamInstant,
+}
+
+/// The stream's frame timeline, advanced by every buffer the runner sees.
+struct FrameClock {
+    frame: u64,
+}
+
+impl FrameClock {
+    fn new() -> Self {
+        Self { frame: 0 }
+    }
+
+    /// The timing of a buffer of `frames`, advancing the clock past it.
+    fn advance(&mut self, frames: usize, timestamp: cpal::OutputStreamTimestamp) -> Timing {
+        let timing = Timing {
+            frame: self.frame,
+            callback: timestamp.callback.into(),
+            playback: timestamp.playback.into(),
+        };
+
+        self.frame += frames as u64;
+
+        timing
+    }
+}
+
 /// A runner that processes audio and handles commands and updates
 ///
 /// This trait is used to define the behavior of the audio loop.
@@ -483,15 +597,22 @@ pub trait Runner: Send {
     /// The type of updates that can be sent out of the runner
     type Update: Send + 'static;
 
-    /// Handle a command that was sent to the runner
+    /// Handle a command that was sent to the runner.
+    ///
+    /// Commands are drained just before the buffer that follows them is rendered, and carry no
+    /// timing of their own; a command that has to sit somewhere on the stream's timeline should be
+    /// stored here and applied in [`Self::run`], where [`Timing`] is available.
     fn handle_command(&mut self, command: Self::Command, on_update: impl FnMut(Self::Update));
 
-    /// Process audio and send out updates if need be
+    /// Process audio and send out updates if need be.
+    ///
+    /// `timing` gives this buffer's position on the stream's timeline; see [`Timing`].
     fn run(
         &mut self,
         output: &mut [f32],
         layout: Layout,
         len: usize,
+        timing: Timing,
         on_update: impl FnMut(Self::Update),
     );
 }
@@ -520,3 +641,96 @@ pub enum CommandError<C> {
 }
 
 pub struct Subscription(u64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a cpal timestamp for driving [`FrameClock`] directly.
+    fn timestamp(callback: StreamInstant, playback: StreamInstant) -> cpal::OutputStreamTimestamp {
+        cpal::OutputStreamTimestamp {
+            callback: callback.inner,
+            playback: playback.inner,
+        }
+    }
+
+    #[test]
+    fn duration_between_instants() {
+        let start = StreamInstant::new(1, 0);
+        let later = StreamInstant::new(1, 500_000_000);
+
+        assert_eq!(later.duration_since(start), Duration::from_millis(500));
+        assert_eq!(start.duration_since(later), Duration::ZERO);
+    }
+
+    #[test]
+    fn checked_duration_between_instants() {
+        let start = StreamInstant::new(1, 0);
+        let later = StreamInstant::new(1, 500_000_000);
+
+        assert_eq!(
+            later.checked_duration_since(start),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(start.checked_duration_since(later), None);
+    }
+
+    #[test]
+    fn offset_an_instant() {
+        let instant = StreamInstant::new(1, 0);
+        let buffer = Duration::from_millis(10);
+
+        assert_eq!(
+            instant.checked_add(buffer),
+            Some(StreamInstant::new(1, 10_000_000))
+        );
+        assert_eq!(
+            instant.checked_sub(buffer),
+            Some(StreamInstant::new(0, 990_000_000))
+        );
+    }
+
+    #[test]
+    fn instants_order_by_time() {
+        assert!(StreamInstant::new(1, 0) < StreamInstant::new(1, 1));
+        assert!(StreamInstant::new(2, 0) > StreamInstant::new(1, 999_999_999));
+    }
+
+    #[test]
+    fn frame_clock_starts_at_zero_and_advances_by_buffer() {
+        let ts = timestamp(StreamInstant::new(1, 0), StreamInstant::new(1, 10_000_000));
+        let mut clock = FrameClock::new();
+
+        assert_eq!(clock.advance(512, ts).frame, 0);
+        assert_eq!(clock.advance(512, ts).frame, 512);
+        assert_eq!(clock.advance(512, ts).frame, 1024);
+    }
+
+    #[test]
+    fn frame_clock_handles_varying_buffer_sizes() {
+        let ts = timestamp(StreamInstant::new(1, 0), StreamInstant::new(1, 10_000_000));
+        let mut clock = FrameClock::new();
+
+        clock.advance(512, ts);
+        assert_eq!(clock.advance(256, ts).frame, 512);
+        assert_eq!(clock.advance(1024, ts).frame, 768);
+        assert_eq!(clock.advance(0, ts).frame, 1792);
+        assert_eq!(clock.advance(64, ts).frame, 1792);
+    }
+
+    #[test]
+    fn frame_clock_passes_timestamps_through() {
+        let callback = StreamInstant::new(1, 0);
+        let playback = StreamInstant::new(1, 10_000_000);
+        let mut clock = FrameClock::new();
+
+        let timing = clock.advance(512, timestamp(callback, playback));
+
+        assert_eq!(timing.callback, callback);
+        assert_eq!(timing.playback, playback);
+        assert_eq!(
+            timing.playback.duration_since(timing.callback),
+            Duration::from_millis(10)
+        );
+    }
+}
