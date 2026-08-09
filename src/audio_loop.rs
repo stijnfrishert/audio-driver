@@ -238,7 +238,7 @@ where
             let (audio_cmd_tx, audio_cmd_rx) = channel();
 
             let stream_result = device.inner().build_output_stream(
-                &cpal_config,
+                cpal_config,
                 move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                     // Handle commands from audio command channel
                     while let Ok(command) = audio_cmd_rx.try_recv() {
