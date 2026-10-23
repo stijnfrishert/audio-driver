@@ -593,6 +593,10 @@ impl FrameClock {
 /// This trait is used to define the behavior of the audio loop.
 /// It is responsible for processing audio, handling commands and sending
 /// out updates in case the audio loop needs to communicate with the outside world.
+///
+/// [`Self::handle_command`] and [`Self::run`] are called from the audio callback, which runs at
+/// real-time priority where the platform allows it, so neither may block, take locks, allocate or
+/// free; any of these can make a buffer late and cause an audible dropout.
 pub trait Runner: Send {
     /// The type of commands that can be sent to the runner
     type Command: Send + 'static;
