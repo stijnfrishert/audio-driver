@@ -43,14 +43,27 @@ where
     /// Thread handle for unparking the update thread
     update_thread: Mutex<Option<thread::Thread>>,
 
-    /// Update buffer capacity
-    update_buffer_capacity: usize,
+    /// Sizes of the queues created for each stream
+    capacities: QueueCapacities,
+}
 
-    /// Command buffer capacity
-    command_buffer_capacity: usize,
+/// How many items each of the audio loop's queues can hold.
+///
+/// Every stream gets fresh queues of these sizes when it starts. What happens when one fills up
+/// differs per queue, as documented on each field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueCapacities {
+    /// Updates sent by the runner that haven't reached the subscribers yet; further updates are
+    /// dropped
+    pub updates: usize,
 
-    /// Error buffer capacity
-    error_buffer_capacity: usize,
+    /// Commands sent to the runner that haven't been handled yet; further sends fail with
+    /// [`CommandError::QueueFull`]
+    pub commands: usize,
+
+    /// Stream errors that haven't reached the error subscribers yet; further errors are counted in
+    /// [`ErrorBatch::dropped`]
+    pub errors: usize,
 }
 
 /// State shared between the handle and the update thread
@@ -257,14 +270,8 @@ where
     /// The handle starts in a stopped state. Call `start()` to begin audio processing.
     ///
     /// # Parameters
-    /// - `update_buffer_capacity`: Maximum number of updates that can be buffered
-    /// - `command_buffer_capacity`: Maximum number of commands that can be buffered
-    /// - `error_buffer_capacity`: Maximum number of stream errors that can be buffered
-    pub fn new(
-        update_buffer_capacity: usize,
-        command_buffer_capacity: usize,
-        error_buffer_capacity: usize,
-    ) -> Self {
+    /// - `capacities`: Sizes of the queues between the caller, the runner and the subscribers
+    pub fn new(capacities: QueueCapacities) -> Self {
         let shared = Arc::new(Shared {
             lifecycle: Mutex::new(0),
             stream: Mutex::new(None),
@@ -284,8 +291,8 @@ where
             let (tx, rx) = std::sync::mpsc::sync_channel::<thread::Thread>(1);
 
             let handle = thread::spawn({
-                let mut updates = Vec::with_capacity(update_buffer_capacity);
-                let mut errors = Vec::with_capacity(error_buffer_capacity);
+                let mut updates = Vec::with_capacity(capacities.updates);
+                let mut errors = Vec::with_capacity(capacities.errors);
                 move || {
                     // Get our own thread handle
                     let _self_handle = rx.recv().unwrap();
@@ -320,9 +327,7 @@ where
                 thread_alive,
                 update_thread_handle: Mutex::new(Some(update_thread_handle)),
                 update_thread: Mutex::new(Some(update_thread)),
-                update_buffer_capacity,
-                command_buffer_capacity,
-                error_buffer_capacity,
+                capacities,
             }),
         }
     }
@@ -355,14 +360,13 @@ where
 
         // Create command ring buffer
         let (command_sender, mut command_receiver) =
-            RingBuffer::new(self.inner.command_buffer_capacity);
+            RingBuffer::new(self.inner.capacities.commands);
 
         // Create update ring buffer
-        let (mut update_sender, update_receiver) =
-            RingBuffer::new(self.inner.update_buffer_capacity);
+        let (mut update_sender, update_receiver) = RingBuffer::new(self.inner.capacities.updates);
 
         // Create error ring buffer
-        let (mut error_sender, error_receiver) = RingBuffer::new(self.inner.error_buffer_capacity);
+        let (mut error_sender, error_receiver) = RingBuffer::new(self.inner.capacities.errors);
         let dropped_errors = Arc::new(AtomicUsize::new(0));
 
         // Prepare data for the audio and error callbacks
@@ -870,7 +874,11 @@ mod tests {
 
     #[test]
     fn update_thread_delivers_errors_as_a_batch() {
-        let handle = AudioLoopHandle::<Silence>::new(1, 1, 4);
+        let handle = AudioLoopHandle::<Silence>::new(QueueCapacities {
+            updates: 1,
+            commands: 1,
+            errors: 4,
+        });
         let (batches_tx, batches_rx) = std::sync::mpsc::channel();
         let _subscription = handle.subscribe_errors(move |batch| {
             let kinds: Vec<_> = batch.errors.iter().map(|e| e.kind()).collect();
