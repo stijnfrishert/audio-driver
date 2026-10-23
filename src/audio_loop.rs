@@ -554,10 +554,13 @@ pub struct Timing {
     /// The predicted instant this buffer reaches the device.
     ///
     /// This, not [`Self::callback`], is the one to timestamp a sound against. But backends derive it
-    /// rather than measure it, and differ in what they fold in: some add a single buffer to the
-    /// callback instant, leaving out whatever latency the hardware adds after that. It is a stable
-    /// reference for *when* a buffer sounds relative to another, not an absolute measure of how late
-    /// it sounds — that needs a round-trip calibration.
+    /// from the latency the device reports rather than measure it, so it is a stable reference for
+    /// *when* a buffer sounds relative to another, not an absolute measure of how late it sounds —
+    /// that needs a round-trip calibration.
+    ///
+    /// It never decreases, but isn't strictly increasing: when latency drops mid-stream (e.g. the
+    /// default device reroutes), it holds at its previous value until the clock catches up, so
+    /// consecutive buffers can share the same instant.
     pub playback: StreamInstant,
 }
 
