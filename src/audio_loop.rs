@@ -7,7 +7,6 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Sender, channel},
     },
     thread,
     time::Duration,
@@ -39,14 +38,11 @@ where
     /// Flag to signal the update thread to exit (on Drop)
     thread_alive: Arc<AtomicBool>,
 
-    /// Command queue and stop signal into the running stream (if running)
-    stream_control: Mutex<Option<StreamControl<R::Command>>>,
+    /// The running stream and its command queue (if running)
+    stream: Mutex<Option<RunningStream<R::Command>>>,
 
     /// Slot for passing update receiver to the update thread
     update_receiver_slot: Arc<Mutex<Option<rtrb::Consumer<R::Update>>>>,
-
-    /// Handle for joining the stream owner thread
-    stream_thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
 
     /// Update thread handle for joining on drop
     update_thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
@@ -64,13 +60,13 @@ where
     config: Mutex<Option<StreamConfig>>,
 }
 
-/// The handle's side of a running stream
-struct StreamControl<C> {
+/// A running stream, owned by the handle
+struct RunningStream<C> {
+    /// Dropping this stops the audio callback
+    _stream: cpal::Stream,
+
     /// Producer of the command queue drained by the audio callback
     commands: rtrb::Producer<C>,
-
-    /// Tells the stream owner thread to drop the stream
-    stop: Sender<()>,
 }
 
 type SubscriberFn<T> = Box<dyn FnMut(&[T]) + Send>;
@@ -183,9 +179,8 @@ where
                 subscribers,
                 stream_active,
                 thread_alive,
-                stream_control: Mutex::new(None),
+                stream: Mutex::new(None),
                 update_receiver_slot,
-                stream_thread_handle: Mutex::new(None),
                 update_thread_handle: Mutex::new(Some(update_thread_handle)),
                 update_thread: Mutex::new(Some(update_thread)),
                 update_buffer_capacity,
@@ -208,22 +203,20 @@ where
         &self,
         device: AudioDevice,
         config: StreamConfig,
-        runner: R,
+        mut runner: R,
     ) -> Result<(), AudioLoopStartError> {
         // Check if already running
         if self.inner.stream_active.load(Ordering::SeqCst) {
             return Err(AudioLoopStartError::AlreadyRunning);
         }
 
-        // Create the channel that tells the stream thread to stop
-        let (stop_tx, stop_rx) = channel::<()>();
-
         // Create command ring buffer
         let (command_sender, mut command_receiver) =
             RingBuffer::new(self.inner.command_buffer_capacity);
 
         // Create update ring buffer
-        let (update_sender, update_receiver) = RingBuffer::new(self.inner.update_buffer_capacity);
+        let (mut update_sender, update_receiver) =
+            RingBuffer::new(self.inner.update_buffer_capacity);
 
         // Pass the update receiver to the update thread
         {
@@ -231,24 +224,15 @@ where
             *slot = Some(update_receiver);
         }
 
-        // Prepare data for stream thread
+        // Prepare data for the audio callback
         let update_thread = self.inner.update_thread.lock().unwrap().clone();
         let channels = config.channels as usize;
         let cpal_config: cpal::StreamConfig = (&config).into();
-        let stream_active = Arc::clone(&self.inner.stream_active);
+        let mut clock = FrameClock::new();
 
-        // Channel to receive result from stream thread
-        let (result_tx, result_rx) = channel::<Result<(), AudioLoopStartError>>();
-
-        // Spawn the stream owner thread
-        let stream_thread = thread::spawn(move || {
-            // Build the stream on this thread (where it will live)
-            let mut runner = runner;
-            let mut update_sender = update_sender;
-
-            let mut clock = FrameClock::new();
-
-            let stream_result = device.inner().build_output_stream(
+        let stream = device
+            .inner()
+            .build_output_stream(
                 cpal_config,
                 move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     // Handle commands queued since the last callback
@@ -275,50 +259,21 @@ where
                     eprintln!("Audio stream error: {}", err);
                 },
                 None,
-            );
+            )
+            .map_err(|e| AudioLoopStartError::BuildStream(e.to_string()))?;
 
-            let stream = match stream_result {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = result_tx.send(Err(AudioLoopStartError::BuildStream(e.to_string())));
-                    return;
-                }
-            };
+        // Start playing
+        stream
+            .play()
+            .map_err(|e| AudioLoopStartError::PlayStream(e.to_string()))?;
 
-            // Start playing
-            if let Err(e) = stream.play() {
-                let _ = result_tx.send(Err(AudioLoopStartError::PlayStream(e.to_string())));
-                return;
-            }
-
-            // Signal success
-            stream_active.store(true, Ordering::SeqCst);
-            let _ = result_tx.send(Ok(()));
-
-            // Keep the stream alive in this thread's scope until told to stop
-            let _ = stop_rx.recv();
-
-            // Stream is dropped here when thread exits
-        });
-
-        // Wait for the result
-        let result = result_rx
-            .recv()
-            .map_err(|_| AudioLoopStartError::BuildStream("Stream thread died".to_string()))?;
-
-        if let Err(e) = result {
-            // Clean up on failure
-            let _ = stream_thread.join();
-            return Err(e);
-        }
-
-        // Store configuration and handles
+        // Store configuration and stream
         *self.inner.config.lock().unwrap() = Some(config);
-        *self.inner.stream_control.lock().unwrap() = Some(StreamControl {
+        *self.inner.stream.lock().unwrap() = Some(RunningStream {
+            _stream: stream,
             commands: command_sender,
-            stop: stop_tx,
         });
-        *self.inner.stream_thread_handle.lock().unwrap() = Some(stream_thread);
+        self.inner.stream_active.store(true, Ordering::SeqCst);
 
         Ok(())
     }
@@ -338,15 +293,9 @@ where
         // Clear stream active flag
         self.inner.stream_active.store(false, Ordering::SeqCst);
 
-        // Send stop message to stream thread
-        if let Some(control) = self.inner.stream_control.lock().unwrap().take() {
-            let _ = control.stop.send(());
-        }
-
-        // Wait for stream thread to finish
-        if let Some(handle) = self.inner.stream_thread_handle.lock().unwrap().take() {
-            let _ = handle.join();
-        }
+        // Drop the stream outside the lock, which stops the audio callback
+        let stream = self.inner.stream.lock().unwrap().take();
+        drop(stream);
 
         // Clear the update receiver slot
         {
@@ -399,8 +348,8 @@ where
     /// Returns an error if the loop is not running, if the command queue is full, or if the
     /// stream is gone.
     pub fn send_command(&self, command: R::Command) -> Result<(), CommandError<R::Command>> {
-        match &mut *self.inner.stream_control.lock().unwrap() {
-            Some(control) => push_command(&mut control.commands, command),
+        match &mut *self.inner.stream.lock().unwrap() {
+            Some(stream) => push_command(&mut stream.commands, command),
             None => Err(CommandError::NotRunning(command)),
         }
     }
@@ -468,15 +417,9 @@ where
         // Stop the stream if running
         self.stream_active.store(false, Ordering::SeqCst);
 
-        // Send stop to stream thread
-        if let Some(control) = self.stream_control.lock().unwrap().take() {
-            let _ = control.stop.send(());
-        }
-
-        // Wait for stream thread
-        if let Some(handle) = self.stream_thread_handle.lock().unwrap().take() {
-            let _ = handle.join();
-        }
+        // Drop the stream outside the lock, which stops the audio callback
+        let stream = self.stream.lock().unwrap().take();
+        drop(stream);
 
         // Signal the update thread to exit
         self.thread_alive.store(false, Ordering::SeqCst);
@@ -678,6 +621,23 @@ mod tests {
             callback: callback.inner,
             playback: playback.inner,
         }
+    }
+
+    #[test]
+    fn handle_is_send_and_sync() {
+        struct Silence;
+
+        impl Runner for Silence {
+            type Command = ();
+            type Update = ();
+
+            fn handle_command(&mut self, _: (), _: impl FnMut(())) {}
+
+            fn run(&mut self, _: &mut [f32], _: Layout, _: usize, _: Timing, _: impl FnMut(())) {}
+        }
+
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AudioLoopHandle<Silence>>();
     }
 
     #[test]
