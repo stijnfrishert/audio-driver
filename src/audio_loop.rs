@@ -32,13 +32,13 @@ where
     /// The subscribers for updates - persists across start/stop cycles
     subscribers: Arc<Mutex<SubscriptionMap<R::Update>>>,
 
-    /// Flag indicating whether the audio stream is currently running
-    stream_active: Arc<AtomicBool>,
-
     /// Flag to signal the update thread to exit (on Drop)
     thread_alive: Arc<AtomicBool>,
 
-    /// The running stream and its command queue (if running)
+    /// Held for the whole of `start` and `stop`, so each runs as a single transition
+    lifecycle: Mutex<()>,
+
+    /// The running stream, its config and its command queue (if running)
     stream: Mutex<Option<RunningStream<R::Command>>>,
 
     /// Slot for passing update receiver to the update thread
@@ -55,15 +55,15 @@ where
 
     /// Command buffer capacity
     command_buffer_capacity: usize,
-
-    /// Current stream config (only valid when running)
-    config: Mutex<Option<StreamConfig>>,
 }
 
 /// A running stream, owned by the handle
 struct RunningStream<C> {
     /// Dropping this stops the audio callback
     _stream: cpal::Stream,
+
+    /// The config the stream was built with
+    config: StreamConfig,
 
     /// Producer of the command queue drained by the audio callback
     commands: rtrb::Producer<C>,
@@ -109,7 +109,6 @@ where
     /// - `command_buffer_capacity`: Maximum number of commands that can be buffered
     pub fn new(update_buffer_capacity: usize, command_buffer_capacity: usize) -> Self {
         let subscribers = Arc::new(Mutex::new(SubscriptionMap::<R::Update>::new()));
-        let stream_active = Arc::new(AtomicBool::new(false));
         let thread_alive = Arc::new(AtomicBool::new(true));
         let update_receiver_slot: Arc<Mutex<Option<rtrb::Consumer<R::Update>>>> =
             Arc::new(Mutex::new(None));
@@ -177,15 +176,14 @@ where
         Self {
             inner: Arc::new(AudioLoopHandleInner {
                 subscribers,
-                stream_active,
                 thread_alive,
+                lifecycle: Mutex::new(()),
                 stream: Mutex::new(None),
                 update_receiver_slot,
                 update_thread_handle: Mutex::new(Some(update_thread_handle)),
                 update_thread: Mutex::new(Some(update_thread)),
                 update_buffer_capacity,
                 command_buffer_capacity,
-                config: Mutex::new(None),
             }),
         }
     }
@@ -205,8 +203,10 @@ where
         config: StreamConfig,
         mut runner: R,
     ) -> Result<(), AudioLoopStartError> {
+        let _lifecycle = self.inner.lifecycle.lock().unwrap();
+
         // Check if already running
-        if self.inner.stream_active.load(Ordering::SeqCst) {
+        if self.inner.stream.lock().unwrap().is_some() {
             return Err(AudioLoopStartError::AlreadyRunning);
         }
 
@@ -217,12 +217,6 @@ where
         // Create update ring buffer
         let (mut update_sender, update_receiver) =
             RingBuffer::new(self.inner.update_buffer_capacity);
-
-        // Pass the update receiver to the update thread
-        {
-            let mut slot = self.inner.update_receiver_slot.lock().unwrap();
-            *slot = Some(update_receiver);
-        }
 
         // Prepare data for the audio callback
         let update_thread = self.inner.update_thread.lock().unwrap().clone();
@@ -267,13 +261,15 @@ where
             .play()
             .map_err(|e| AudioLoopStartError::PlayStream(e.to_string()))?;
 
-        // Store configuration and stream
-        *self.inner.config.lock().unwrap() = Some(config);
+        // Pass the update receiver to the update thread
+        *self.inner.update_receiver_slot.lock().unwrap() = Some(update_receiver);
+
+        // Store the stream, which marks the loop as running
         *self.inner.stream.lock().unwrap() = Some(RunningStream {
             _stream: stream,
+            config,
             commands: command_sender,
         });
-        self.inner.stream_active.store(true, Ordering::SeqCst);
 
         Ok(())
     }
@@ -286,15 +282,12 @@ where
     /// # Returns
     /// `true` if the loop was running and is now stopped, `false` if already stopped.
     pub fn stop(&self) -> bool {
-        if !self.inner.stream_active.load(Ordering::SeqCst) {
-            return false;
-        }
-
-        // Clear stream active flag
-        self.inner.stream_active.store(false, Ordering::SeqCst);
+        let _lifecycle = self.inner.lifecycle.lock().unwrap();
 
         // Drop the stream outside the lock, which stops the audio callback
-        let stream = self.inner.stream.lock().unwrap().take();
+        let Some(stream) = self.inner.stream.lock().unwrap().take() else {
+            return false;
+        };
         drop(stream);
 
         // Clear the update receiver slot
@@ -302,9 +295,6 @@ where
             let mut slot = self.inner.update_receiver_slot.lock().unwrap();
             *slot = None;
         }
-
-        // Clear config
-        *self.inner.config.lock().unwrap() = None;
 
         // Wake the update thread so it can process any remaining updates
         if let Some(ref thread) = *self.inner.update_thread.lock().unwrap() {
@@ -316,27 +306,27 @@ where
 
     /// Check if the audio loop is currently running.
     pub fn is_running(&self) -> bool {
-        self.inner.stream_active.load(Ordering::SeqCst)
+        self.inner.stream.lock().unwrap().is_some()
     }
 
     /// Get the sample rate if the loop is running.
     pub fn sample_rate(&self) -> Option<u32> {
         self.inner
-            .config
+            .stream
             .lock()
             .unwrap()
             .as_ref()
-            .map(|c| c.sample_rate)
+            .map(|s| s.config.sample_rate)
     }
 
     /// Get the channel count if the loop is running.
     pub fn channel_count(&self) -> Option<usize> {
         self.inner
-            .config
+            .stream
             .lock()
             .unwrap()
             .as_ref()
-            .map(|c| c.channels as usize)
+            .map(|s| s.config.channels as usize)
     }
 
     /// Send a command to the runner in the audio loop.
@@ -414,9 +404,6 @@ where
     R: Runner,
 {
     fn drop(&mut self) {
-        // Stop the stream if running
-        self.stream_active.store(false, Ordering::SeqCst);
-
         // Drop the stream outside the lock, which stops the audio callback
         let stream = self.stream.lock().unwrap().take();
         drop(stream);
