@@ -39,9 +39,8 @@ where
     /// Flag to signal the update thread to exit (on Drop)
     thread_alive: Arc<AtomicBool>,
 
-    /// Sender to the stream owner thread (if running)
-    /// Used to send commands and stop signal
-    stream_command_sender: Mutex<Option<Sender<StreamThreadMessage<R::Command>>>>,
+    /// Command queue and stop signal into the running stream (if running)
+    stream_control: Mutex<Option<StreamControl<R::Command>>>,
 
     /// Slot for passing update receiver to the update thread
     update_receiver_slot: Arc<Mutex<Option<rtrb::Consumer<R::Update>>>>,
@@ -58,14 +57,20 @@ where
     /// Update buffer capacity
     update_buffer_capacity: usize,
 
+    /// Command buffer capacity
+    command_buffer_capacity: usize,
+
     /// Current stream config (only valid when running)
     config: Mutex<Option<StreamConfig>>,
 }
 
-/// Messages sent to the stream owner thread
-enum StreamThreadMessage<C> {
-    Command(C),
-    Stop,
+/// The handle's side of a running stream
+struct StreamControl<C> {
+    /// Producer of the command queue drained by the audio callback
+    commands: rtrb::Producer<C>,
+
+    /// Tells the stream owner thread to drop the stream
+    stop: Sender<()>,
 }
 
 type SubscriberFn<T> = Box<dyn FnMut(&[T]) + Send>;
@@ -105,7 +110,8 @@ where
     ///
     /// # Parameters
     /// - `update_buffer_capacity`: Maximum number of updates that can be buffered
-    pub fn new(update_buffer_capacity: usize) -> Self {
+    /// - `command_buffer_capacity`: Maximum number of commands that can be buffered
+    pub fn new(update_buffer_capacity: usize, command_buffer_capacity: usize) -> Self {
         let subscribers = Arc::new(Mutex::new(SubscriptionMap::<R::Update>::new()));
         let stream_active = Arc::new(AtomicBool::new(false));
         let thread_alive = Arc::new(AtomicBool::new(true));
@@ -177,12 +183,13 @@ where
                 subscribers,
                 stream_active,
                 thread_alive,
-                stream_command_sender: Mutex::new(None),
+                stream_control: Mutex::new(None),
                 update_receiver_slot,
                 stream_thread_handle: Mutex::new(None),
                 update_thread_handle: Mutex::new(Some(update_thread_handle)),
                 update_thread: Mutex::new(Some(update_thread)),
                 update_buffer_capacity,
+                command_buffer_capacity,
                 config: Mutex::new(None),
             }),
         }
@@ -208,8 +215,12 @@ where
             return Err(AudioLoopStartError::AlreadyRunning);
         }
 
-        // Create the channel for stream thread communication
-        let (stream_tx, stream_rx) = channel::<StreamThreadMessage<R::Command>>();
+        // Create the channel that tells the stream thread to stop
+        let (stop_tx, stop_rx) = channel::<()>();
+
+        // Create command ring buffer
+        let (command_sender, mut command_receiver) =
+            RingBuffer::new(self.inner.command_buffer_capacity);
 
         // Create update ring buffer
         let (update_sender, update_receiver) = RingBuffer::new(self.inner.update_buffer_capacity);
@@ -235,16 +246,13 @@ where
             let mut runner = runner;
             let mut update_sender = update_sender;
 
-            // Create command channel for audio callback
-            let (audio_cmd_tx, audio_cmd_rx) = channel();
-
             let mut clock = FrameClock::new();
 
             let stream_result = device.inner().build_output_stream(
                 cpal_config,
                 move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                    // Handle commands from audio command channel
-                    while let Ok(command) = audio_cmd_rx.try_recv() {
+                    // Handle commands queued since the last callback
+                    while let Ok(command) = command_receiver.pop() {
                         runner.handle_command(command, |update| {
                             let _ = update_sender.push(update);
                         });
@@ -287,12 +295,8 @@ where
             stream_active.store(true, Ordering::SeqCst);
             let _ = result_tx.send(Ok(()));
 
-            // Keep the stream alive and forward commands
-            // The stream lives in this thread's scope
-            while let Ok(StreamThreadMessage::Command(cmd)) = stream_rx.recv() {
-                // Forward command to audio callback
-                let _ = audio_cmd_tx.send(cmd);
-            }
+            // Keep the stream alive in this thread's scope until told to stop
+            let _ = stop_rx.recv();
 
             // Stream is dropped here when thread exits
         });
@@ -310,7 +314,10 @@ where
 
         // Store configuration and handles
         *self.inner.config.lock().unwrap() = Some(config);
-        *self.inner.stream_command_sender.lock().unwrap() = Some(stream_tx);
+        *self.inner.stream_control.lock().unwrap() = Some(StreamControl {
+            commands: command_sender,
+            stop: stop_tx,
+        });
         *self.inner.stream_thread_handle.lock().unwrap() = Some(stream_thread);
 
         Ok(())
@@ -332,8 +339,8 @@ where
         self.inner.stream_active.store(false, Ordering::SeqCst);
 
         // Send stop message to stream thread
-        if let Some(sender) = self.inner.stream_command_sender.lock().unwrap().take() {
-            let _ = sender.send(StreamThreadMessage::Stop);
+        if let Some(control) = self.inner.stream_control.lock().unwrap().take() {
+            let _ = control.stop.send(());
         }
 
         // Wait for stream thread to finish
@@ -385,17 +392,15 @@ where
 
     /// Send a command to the runner in the audio loop.
     ///
+    /// Never blocks: the command is queued for the next audio callback, and handed back in the
+    /// error if it can't be.
+    ///
     /// # Errors
-    /// Returns an error if the loop is not running or if the send fails.
+    /// Returns an error if the loop is not running, if the command queue is full, or if the
+    /// stream is gone.
     pub fn send_command(&self, command: R::Command) -> Result<(), CommandError<R::Command>> {
-        let sender = self.inner.stream_command_sender.lock().unwrap();
-        match &*sender {
-            Some(tx) => tx
-                .send(StreamThreadMessage::Command(command))
-                .map_err(|e| match e.0 {
-                    StreamThreadMessage::Command(c) => CommandError::SendFailed(c),
-                    StreamThreadMessage::Stop => unreachable!(),
-                }),
+        match &mut *self.inner.stream_control.lock().unwrap() {
+            Some(control) => push_command(&mut control.commands, command),
             None => Err(CommandError::NotRunning(command)),
         }
     }
@@ -433,6 +438,17 @@ where
     }
 }
 
+/// Queue a command for the audio callback, handing it back if it can't be delivered.
+fn push_command<C>(commands: &mut rtrb::Producer<C>, command: C) -> Result<(), CommandError<C>> {
+    if commands.is_abandoned() {
+        return Err(CommandError::SendFailed(command));
+    }
+
+    commands
+        .push(command)
+        .map_err(|rtrb::PushError::Full(command)| CommandError::QueueFull(command))
+}
+
 impl<R> Clone for AudioLoopHandle<R>
 where
     R: Runner,
@@ -453,8 +469,8 @@ where
         self.stream_active.store(false, Ordering::SeqCst);
 
         // Send stop to stream thread
-        if let Some(sender) = self.stream_command_sender.lock().unwrap().take() {
-            let _ = sender.send(StreamThreadMessage::Stop);
+        if let Some(control) = self.stream_control.lock().unwrap().take() {
+            let _ = control.stop.send(());
         }
 
         // Wait for stream thread
@@ -645,6 +661,9 @@ pub enum CommandError<C> {
 
     #[error("Failed to send command")]
     SendFailed(C),
+
+    #[error("Command queue is full")]
+    QueueFull(C),
 }
 
 pub struct Subscription(u64);
@@ -659,6 +678,31 @@ mod tests {
             callback: callback.inner,
             playback: playback.inner,
         }
+    }
+
+    #[test]
+    fn push_command_queues_until_full() {
+        let (mut commands, mut receiver) = RingBuffer::new(1);
+
+        assert!(push_command(&mut commands, 1).is_ok());
+        assert!(matches!(
+            push_command(&mut commands, 2),
+            Err(CommandError::QueueFull(2))
+        ));
+
+        assert_eq!(receiver.pop(), Ok(1));
+        assert!(push_command(&mut commands, 3).is_ok());
+    }
+
+    #[test]
+    fn push_command_fails_once_the_stream_is_gone() {
+        let (mut commands, receiver) = RingBuffer::new(1);
+        drop(receiver);
+
+        assert!(matches!(
+            push_command(&mut commands, 1),
+            Err(CommandError::SendFailed(1))
+        ));
     }
 
     #[test]
