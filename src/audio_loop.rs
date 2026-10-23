@@ -54,7 +54,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueCapacities {
     /// Updates sent by the runner that haven't reached the subscribers yet; further updates are
-    /// dropped
+    /// handed back to the runner
     pub updates: usize,
 
     /// Commands sent to the runner that haven't been handled yet; further sends fail with
@@ -385,7 +385,7 @@ where
                     // Handle commands queued since the last callback
                     while let Ok(command) = command_receiver.pop() {
                         runner.handle_command(command, |update| {
-                            let _ = update_sender.push(update);
+                            push_update(&mut update_sender, update)
                         });
                     }
 
@@ -394,7 +394,7 @@ where
                     let timing = clock.advance(frames, info.timestamp());
 
                     runner.run(data, Layout::Interleaved, frames, timing, |update| {
-                        let _ = update_sender.push(update);
+                        push_update(&mut update_sender, update)
                     });
 
                     // Wake the update thread to process any new updates
@@ -582,6 +582,13 @@ where
     }
 }
 
+/// Queue an update for the subscribers, handing it back if the queue is full.
+fn push_update<U>(updates: &mut rtrb::Producer<U>, update: U) -> Result<(), U> {
+    updates
+        .push(update)
+        .map_err(|rtrb::PushError::Full(update)| update)
+}
+
 /// Queue a stream error for the update thread, counting it as dropped if the queue is full.
 fn report_error(
     errors: &mut rtrb::Producer<StreamError>,
@@ -760,6 +767,10 @@ impl FrameClock {
 /// [`Self::handle_command`] and [`Self::run`] are called from the audio callback, which runs at
 /// real-time priority where the platform allows it, so neither may block, take locks, allocate or
 /// free; any of these can make a buffer late and cause an audible dropout.
+///
+/// Both send updates through `on_update`, which hands an update back as `Err` when the update
+/// queue is full (see [`QueueCapacities::updates`]). The runner decides what that means: keep the
+/// latest value and send it with a later buffer, retry an event that must arrive, or drop it.
 pub trait Runner: Send {
     /// The type of commands that can be sent to the runner
     type Command: Send + 'static;
@@ -772,7 +783,11 @@ pub trait Runner: Send {
     /// Commands are drained just before the buffer that follows them is rendered, and carry no
     /// timing of their own; a command that has to sit somewhere on the stream's timeline should be
     /// stored here and applied in [`Self::run`], where [`Timing`] is available.
-    fn handle_command(&mut self, command: Self::Command, on_update: impl FnMut(Self::Update));
+    fn handle_command(
+        &mut self,
+        command: Self::Command,
+        on_update: impl FnMut(Self::Update) -> Result<(), Self::Update>,
+    );
 
     /// Process audio and send out updates if need be.
     ///
@@ -783,7 +798,7 @@ pub trait Runner: Send {
         layout: Layout,
         len: usize,
         timing: Timing,
-        on_update: impl FnMut(Self::Update),
+        on_update: impl FnMut(Self::Update) -> Result<(), Self::Update>,
     );
 }
 
@@ -835,9 +850,17 @@ mod tests {
         type Command = ();
         type Update = ();
 
-        fn handle_command(&mut self, _: (), _: impl FnMut(())) {}
+        fn handle_command(&mut self, _: (), _: impl FnMut(()) -> Result<(), ()>) {}
 
-        fn run(&mut self, _: &mut [f32], _: Layout, _: usize, _: Timing, _: impl FnMut(())) {}
+        fn run(
+            &mut self,
+            _: &mut [f32],
+            _: Layout,
+            _: usize,
+            _: Timing,
+            _: impl FnMut(()) -> Result<(), ()>,
+        ) {
+        }
     }
 
     #[test]
@@ -1018,6 +1041,17 @@ mod tests {
         assert!(!stops_stream(StreamErrorKind::DeviceChanged));
         assert!(!stops_stream(StreamErrorKind::BackendError));
         assert!(!stops_stream(StreamErrorKind::Other));
+    }
+
+    #[test]
+    fn push_update_hands_back_what_doesnt_fit() {
+        let (mut updates, mut receiver) = RingBuffer::new(1);
+
+        assert_eq!(push_update(&mut updates, 1), Ok(()));
+        assert_eq!(push_update(&mut updates, 2), Err(2));
+
+        assert_eq!(receiver.pop(), Ok(1));
+        assert_eq!(push_update(&mut updates, 3), Ok(()));
     }
 
     #[test]
