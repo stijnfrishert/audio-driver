@@ -182,6 +182,9 @@ pub enum BufferSize {
 }
 
 /// Enumerate all available audio output devices
+///
+/// A stream on one of these stays on that device, even if it is also the system default; see
+/// [`default_output_device`] for how that differs.
 pub fn enumerate_output_devices() -> Result<impl Iterator<Item = AudioDevice>, EnumerateError> {
     let host = cpal::default_host();
     host.output_devices()
@@ -190,6 +193,21 @@ pub fn enumerate_output_devices() -> Result<impl Iterator<Item = AudioDevice>, E
 }
 
 /// Get the default output device
+///
+/// On backends that support it (CoreAudio, WASAPI), a stream on this device follows the system
+/// default: when the default changes, the stream is rerouted and reports
+/// [`StreamErrorKind::DeviceChanged`] instead of stopping. On macOS it also keeps running when the
+/// device's sample rate changes: CoreAudio converts to the device's rate, so the stream keeps its
+/// own rate, though the number of frames per callback can change.
+///
+/// To stay on the current default device instead, find it among [`enumerate_output_devices`] by
+/// its [`AudioDevice::id`]. A stream on that device stops when the device's sample rate changes
+/// ([`StreamErrorKind::StreamInvalidated`]) or the device disappears
+/// ([`StreamErrorKind::DeviceNotAvailable`]).
+///
+/// [`StreamErrorKind::DeviceChanged`]: crate::audio_loop::StreamErrorKind::DeviceChanged
+/// [`StreamErrorKind::StreamInvalidated`]: crate::audio_loop::StreamErrorKind::StreamInvalidated
+/// [`StreamErrorKind::DeviceNotAvailable`]: crate::audio_loop::StreamErrorKind::DeviceNotAvailable
 pub fn default_output_device() -> Option<AudioDevice> {
     cpal::default_host()
         .default_output_device()
