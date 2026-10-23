@@ -6,12 +6,14 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
 };
 use thiserror::Error;
+
+pub use cpal::{Error as StreamError, ErrorKind as StreamErrorKind};
 
 /// A handle to an audio loop that can be started and stopped.
 ///
@@ -30,7 +32,10 @@ where
     R: Runner,
 {
     /// The subscribers for updates - persists across start/stop cycles
-    subscribers: Arc<Mutex<SubscriptionMap<R::Update>>>,
+    subscribers: Arc<Mutex<SubscriptionMap<UpdateSubscriberFn<R::Update>>>>,
+
+    /// The subscribers for stream errors - persists across start/stop cycles
+    error_subscribers: Arc<Mutex<SubscriptionMap<ErrorSubscriberFn>>>,
 
     /// Flag to signal the update thread to exit (on Drop)
     thread_alive: Arc<AtomicBool>,
@@ -44,6 +49,9 @@ where
     /// Slot for passing update receiver to the update thread
     update_receiver_slot: Arc<Mutex<Option<rtrb::Consumer<R::Update>>>>,
 
+    /// Slot for passing error receiver to the update thread
+    error_receiver_slot: Arc<Mutex<Option<ErrorReceiver>>>,
+
     /// Update thread handle for joining on drop
     update_thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
 
@@ -55,6 +63,9 @@ where
 
     /// Command buffer capacity
     command_buffer_capacity: usize,
+
+    /// Error buffer capacity
+    error_buffer_capacity: usize,
 }
 
 /// A running stream, owned by the handle
@@ -69,14 +80,34 @@ struct RunningStream<C> {
     commands: rtrb::Producer<C>,
 }
 
-type SubscriberFn<T> = Box<dyn FnMut(&[T]) + Send>;
+/// The update thread's side of a stream's error queue
+struct ErrorReceiver {
+    /// Consumer of the errors reported by the stream
+    errors: rtrb::Consumer<StreamError>,
 
-struct SubscriptionMap<T> {
-    map: HashMap<u64, SubscriberFn<T>>,
+    /// Errors dropped because the queue was full, since the last batch
+    dropped: Arc<AtomicUsize>,
+}
+
+/// Errors reported by the stream since the last batch.
+#[derive(Debug)]
+pub struct ErrorBatch<'a> {
+    /// The errors, in the order they were reported
+    pub errors: &'a [StreamError],
+
+    /// Errors lost because the error queue was full, reported before the ones in `errors`
+    pub dropped: usize,
+}
+
+type UpdateSubscriberFn<T> = dyn FnMut(&[T]) + Send;
+type ErrorSubscriberFn = dyn FnMut(&ErrorBatch<'_>) + Send;
+
+struct SubscriptionMap<F: ?Sized> {
+    map: HashMap<u64, Box<F>>,
     next_key: u64,
 }
 
-impl<T> SubscriptionMap<T> {
+impl<F: ?Sized> SubscriptionMap<F> {
     fn new() -> Self {
         Self {
             map: HashMap::new(),
@@ -84,7 +115,7 @@ impl<T> SubscriptionMap<T> {
         }
     }
 
-    fn insert(&mut self, callback: SubscriberFn<T>) -> u64 {
+    fn insert(&mut self, callback: Box<F>) -> u64 {
         let key = self.next_key;
         self.next_key += 1;
         self.map.insert(key, callback);
@@ -107,23 +138,35 @@ where
     /// # Parameters
     /// - `update_buffer_capacity`: Maximum number of updates that can be buffered
     /// - `command_buffer_capacity`: Maximum number of commands that can be buffered
-    pub fn new(update_buffer_capacity: usize, command_buffer_capacity: usize) -> Self {
-        let subscribers = Arc::new(Mutex::new(SubscriptionMap::<R::Update>::new()));
+    /// - `error_buffer_capacity`: Maximum number of stream errors that can be buffered
+    pub fn new(
+        update_buffer_capacity: usize,
+        command_buffer_capacity: usize,
+        error_buffer_capacity: usize,
+    ) -> Self {
+        let subscribers: Arc<Mutex<SubscriptionMap<UpdateSubscriberFn<R::Update>>>> =
+            Arc::new(Mutex::new(SubscriptionMap::new()));
+        let error_subscribers: Arc<Mutex<SubscriptionMap<ErrorSubscriberFn>>> =
+            Arc::new(Mutex::new(SubscriptionMap::new()));
         let thread_alive = Arc::new(AtomicBool::new(true));
         let update_receiver_slot: Arc<Mutex<Option<rtrb::Consumer<R::Update>>>> =
             Arc::new(Mutex::new(None));
+        let error_receiver_slot: Arc<Mutex<Option<ErrorReceiver>>> = Arc::new(Mutex::new(None));
 
         // Spawn the persistent update thread
         let (update_thread_handle, update_thread) = {
             let subscribers = Arc::clone(&subscribers);
+            let error_subscribers = Arc::clone(&error_subscribers);
             let thread_alive = Arc::clone(&thread_alive);
             let update_receiver_slot = Arc::clone(&update_receiver_slot);
+            let error_receiver_slot = Arc::clone(&error_receiver_slot);
 
             // Channel to pass the thread handle to itself
             let (tx, rx) = std::sync::mpsc::sync_channel::<thread::Thread>(1);
 
             let handle = thread::spawn({
                 let mut updates = Vec::with_capacity(update_buffer_capacity);
+                let mut errors = Vec::with_capacity(error_buffer_capacity);
                 move || {
                     // Get our own thread handle
                     let _self_handle = rx.recv().unwrap();
@@ -160,6 +203,37 @@ where
                             updates.clear();
                         }
 
+                        // Drain and dispatch stream errors the same way
+                        let dropped = {
+                            let mut slot = error_receiver_slot.lock().unwrap();
+                            match *slot {
+                                Some(ref mut receiver) => {
+                                    if let Ok(chunk) =
+                                        receiver.errors.read_chunk(receiver.errors.slots())
+                                    {
+                                        errors.extend(chunk);
+                                    }
+                                    receiver.dropped.swap(0, Ordering::Relaxed)
+                                }
+                                None => 0,
+                            }
+                        };
+
+                        if !errors.is_empty() || dropped > 0 {
+                            {
+                                let batch = ErrorBatch {
+                                    errors: &errors,
+                                    dropped,
+                                };
+                                let mut subs = error_subscribers.lock().unwrap();
+                                for subscriber in subs.map.values_mut() {
+                                    subscriber(&batch);
+                                }
+                            }
+
+                            errors.clear();
+                        }
+
                         // Park until woken by audio callback, start/stop, or shutdown
                         if thread_alive.load(Ordering::SeqCst) {
                             thread::park();
@@ -176,14 +250,17 @@ where
         Self {
             inner: Arc::new(AudioLoopHandleInner {
                 subscribers,
+                error_subscribers,
                 thread_alive,
                 lifecycle: Mutex::new(()),
                 stream: Mutex::new(None),
                 update_receiver_slot,
+                error_receiver_slot,
                 update_thread_handle: Mutex::new(Some(update_thread_handle)),
                 update_thread: Mutex::new(Some(update_thread)),
                 update_buffer_capacity,
                 command_buffer_capacity,
+                error_buffer_capacity,
             }),
         }
     }
@@ -218,8 +295,14 @@ where
         let (mut update_sender, update_receiver) =
             RingBuffer::new(self.inner.update_buffer_capacity);
 
-        // Prepare data for the audio callback
+        // Create error ring buffer
+        let (mut error_sender, error_receiver) = RingBuffer::new(self.inner.error_buffer_capacity);
+        let dropped_errors = Arc::new(AtomicUsize::new(0));
+
+        // Prepare data for the audio and error callbacks
         let update_thread = self.inner.update_thread.lock().unwrap().clone();
+        let error_update_thread = update_thread.clone();
+        let error_dropped = Arc::clone(&dropped_errors);
         let channels = config.channels as usize;
         let cpal_config: cpal::StreamConfig = (&config).into();
         let mut clock = FrameClock::new();
@@ -249,8 +332,13 @@ where
                         thread.unpark();
                     }
                 },
-                |err| {
-                    eprintln!("Audio stream error: {}", err);
+                move |err| {
+                    // May run on the audio thread, so this stays as lock-free as the data callback
+                    report_error(&mut error_sender, &error_dropped, err);
+
+                    if let Some(ref thread) = error_update_thread {
+                        thread.unpark();
+                    }
                 },
                 None,
             )
@@ -261,8 +349,12 @@ where
             .play()
             .map_err(|e| AudioLoopStartError::PlayStream(e.to_string()))?;
 
-        // Pass the update receiver to the update thread
+        // Pass the update and error receivers to the update thread
         *self.inner.update_receiver_slot.lock().unwrap() = Some(update_receiver);
+        *self.inner.error_receiver_slot.lock().unwrap() = Some(ErrorReceiver {
+            errors: error_receiver,
+            dropped: dropped_errors,
+        });
 
         // Store the stream, which marks the loop as running
         *self.inner.stream.lock().unwrap() = Some(RunningStream {
@@ -290,11 +382,9 @@ where
         };
         drop(stream);
 
-        // Clear the update receiver slot
-        {
-            let mut slot = self.inner.update_receiver_slot.lock().unwrap();
-            *slot = None;
-        }
+        // Clear the update and error receiver slots
+        *self.inner.update_receiver_slot.lock().unwrap() = None;
+        *self.inner.error_receiver_slot.lock().unwrap() = None;
 
         // Wake the update thread so it can process any remaining updates
         if let Some(ref thread) = *self.inner.update_thread.lock().unwrap() {
@@ -374,6 +464,50 @@ where
             .lock()
             .unwrap()
             .remove(subscription.0)
+    }
+
+    /// Register a listener for errors reported by the audio stream.
+    ///
+    /// The callback runs on the update thread and receives each wake-up's errors as a single
+    /// batch, in the order they were reported. Subscriptions persist across start/stop cycles.
+    ///
+    /// # Warning
+    /// The callback must not call `subscribe_errors` or `unsubscribe_errors` - doing so will
+    /// deadlock.
+    pub fn subscribe_errors<F>(&self, callback: F) -> ErrorSubscription
+    where
+        F: FnMut(&ErrorBatch<'_>) + Send + 'static,
+    {
+        let id = self
+            .inner
+            .error_subscribers
+            .lock()
+            .unwrap()
+            .insert(Box::new(callback));
+        ErrorSubscription(id)
+    }
+
+    /// Unregister a listener for errors reported by the audio stream.
+    ///
+    /// # Warning
+    /// Must not be called from within an error subscriber callback - doing so will deadlock.
+    pub fn unsubscribe_errors(&self, subscription: ErrorSubscription) -> bool {
+        self.inner
+            .error_subscribers
+            .lock()
+            .unwrap()
+            .remove(subscription.0)
+    }
+}
+
+/// Queue a stream error for the update thread, counting it as dropped if the queue is full.
+fn report_error(
+    errors: &mut rtrb::Producer<StreamError>,
+    dropped: &AtomicUsize,
+    error: StreamError,
+) {
+    if errors.push(error).is_err() {
+        dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -598,6 +732,8 @@ pub enum CommandError<C> {
 
 pub struct Subscription(u64);
 
+pub struct ErrorSubscription(u64);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,21 +746,91 @@ mod tests {
         }
     }
 
+    struct Silence;
+
+    impl Runner for Silence {
+        type Command = ();
+        type Update = ();
+
+        fn handle_command(&mut self, _: (), _: impl FnMut(())) {}
+
+        fn run(&mut self, _: &mut [f32], _: Layout, _: usize, _: Timing, _: impl FnMut(())) {}
+    }
+
     #[test]
     fn handle_is_send_and_sync() {
-        struct Silence;
-
-        impl Runner for Silence {
-            type Command = ();
-            type Update = ();
-
-            fn handle_command(&mut self, _: (), _: impl FnMut(())) {}
-
-            fn run(&mut self, _: &mut [f32], _: Layout, _: usize, _: Timing, _: impl FnMut(())) {}
-        }
-
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AudioLoopHandle<Silence>>();
+    }
+
+    #[test]
+    fn report_error_counts_errors_that_dont_fit() {
+        let (mut errors, mut receiver) = RingBuffer::new(1);
+        let dropped = AtomicUsize::new(0);
+
+        report_error(
+            &mut errors,
+            &dropped,
+            StreamError::new(StreamErrorKind::Xrun),
+        );
+        report_error(
+            &mut errors,
+            &dropped,
+            StreamError::new(StreamErrorKind::Xrun),
+        );
+        report_error(
+            &mut errors,
+            &dropped,
+            StreamError::new(StreamErrorKind::Xrun),
+        );
+
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(receiver.pop().map(|e| e.kind()), Ok(StreamErrorKind::Xrun));
+        assert!(receiver.pop().is_err());
+    }
+
+    #[test]
+    fn update_thread_delivers_errors_as_a_batch() {
+        let handle = AudioLoopHandle::<Silence>::new(1, 1, 4);
+        let (batches_tx, batches_rx) = std::sync::mpsc::channel();
+        let _subscription = handle.subscribe_errors(move |batch| {
+            let kinds: Vec<_> = batch.errors.iter().map(|e| e.kind()).collect();
+            batches_tx.send((kinds, batch.dropped)).unwrap();
+        });
+
+        // Stand in for a running stream's error callback
+        let (mut errors, receiver) = RingBuffer::new(4);
+        let dropped = Arc::new(AtomicUsize::new(3));
+        report_error(
+            &mut errors,
+            &dropped,
+            StreamError::new(StreamErrorKind::Xrun),
+        );
+        report_error(
+            &mut errors,
+            &dropped,
+            StreamError::new(StreamErrorKind::RealtimeDenied),
+        );
+        *handle.inner.error_receiver_slot.lock().unwrap() = Some(ErrorReceiver {
+            errors: receiver,
+            dropped: Arc::clone(&dropped),
+        });
+        handle
+            .inner
+            .update_thread
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .unpark();
+
+        let (kinds, batch_dropped) = batches_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            kinds,
+            [StreamErrorKind::Xrun, StreamErrorKind::RealtimeDenied]
+        );
+        assert_eq!(batch_dropped, 3);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
 
     #[test]
