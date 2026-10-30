@@ -4,6 +4,7 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use rtrb::RingBuffer;
 use std::{
     collections::{HashMap, VecDeque},
+    ops::Range,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -80,7 +81,7 @@ where
 
     /// Update receivers of current and stopped streams, oldest first; each is dropped once its
     /// stream is gone and it has been drained
-    update_receivers: Mutex<VecDeque<rtrb::Consumer<R::Update>>>,
+    update_receivers: Mutex<VecDeque<UpdateReceiver<R::Update>>>,
 
     /// Error receivers of current and stopped streams, kept the same way
     error_receivers: Mutex<VecDeque<ErrorReceiver>>,
@@ -107,6 +108,24 @@ struct RunningStream<C> {
     commands: rtrb::Producer<C>,
 }
 
+/// Identifies one run of the loop, from a call to [`AudioLoopHandle::start`] to the stream's stop.
+///
+/// The caller picks it and the loop only copies it into every batch the run delivers; making it
+/// unique is up to the caller. It is picked rather than returned because a run's first batches
+/// can be delivered before `start` returns. A stopped run's leftover batches may still arrive after
+/// its stop batch and after a later `start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RunId(pub u64);
+
+/// The update thread's side of a stream's update queue
+struct UpdateReceiver<U> {
+    /// Consumer of the updates sent by the runner
+    updates: rtrb::Consumer<U>,
+
+    /// The run the stream belongs to
+    run: RunId,
+}
+
 /// The update thread's side of a stream's error queue
 struct ErrorReceiver {
     /// Consumer of the errors reported by the stream
@@ -115,28 +134,45 @@ struct ErrorReceiver {
     /// Errors dropped because the queue was full, since the last batch
     dropped: Arc<AtomicUsize>,
 
+    /// The run the stream belongs to
+    run: RunId,
+
     /// The generation of the stream reporting into this queue
     generation: u64,
 }
 
-/// Errors reported by the stream since the last batch.
+/// Updates sent by one run's runner since the last batch.
+#[derive(Debug)]
+pub struct UpdateBatch<'a, U> {
+    /// The run that sent the updates; may be a stopped one whose leftovers arrive late
+    pub run: RunId,
+
+    /// The updates, in the order they were sent
+    pub updates: &'a [U],
+}
+
+/// Errors reported by one run's stream since the last batch.
 #[derive(Debug)]
 pub struct ErrorBatch<'a> {
+    /// The run that reported the errors; may be a stopped one whose leftovers arrive late
+    pub run: RunId,
+
     /// The errors, in the order they were reported
     pub errors: &'a [StreamError],
 
     /// Errors lost because the error queue was full, reported before the ones in `errors`
     pub dropped: usize,
 
-    /// Whether the loop was stopped because of an error in this batch.
+    /// Whether the run was stopped because of an error in this batch.
     ///
     /// The loop stops itself on [`StreamErrorKind::DeviceNotAvailable`] and
     /// [`StreamErrorKind::StreamInvalidated`], after which the stream can't continue. By the
-    /// time this batch is delivered, [`AudioLoopHandle::is_running`] already returns `false`.
+    /// time this batch is delivered, the run named in it no longer runs, though the loop may have
+    /// been started again since.
     pub stopped: bool,
 }
 
-type UpdateSubscriberFn<T> = dyn FnMut(&[T]) + Send;
+type UpdateSubscriberFn<T> = dyn FnMut(&UpdateBatch<'_, T>) + Send;
 type ErrorSubscriberFn = dyn FnMut(&ErrorBatch<'_>) + Send;
 
 struct SubscriptionMap<F: ?Sized> {
@@ -180,77 +216,152 @@ where
         }
     }
 
-    /// Drain every update and error queue, stop the stream if it reported a fatal error, and
-    /// dispatch what was drained to the subscribers.
+    /// Drain every queue, stop a stream that reported a fatal error, and dispatch the batches.
+    ///
+    /// Each receiver that yielded something becomes one batch, oldest receiver first. Receivers
+    /// whose stream is gone are dropped once drained.
     ///
     /// Returns whether the stream was stopped, in which case its queues should be drained once
     /// more.
-    fn pump(&self, updates: &mut Vec<R::Update>, errors: &mut Vec<StreamError>) -> bool {
-        drain_receivers(&mut self.update_receivers.lock().unwrap(), |receiver| {
-            if let Ok(chunk) = receiver.read_chunk(receiver.slots()) {
-                updates.extend(chunk);
-            }
-            receiver.is_abandoned()
-        });
+    fn pump(&self, buffers: &mut PumpBuffers<R::Update>) -> bool {
+        let PumpBuffers {
+            updates,
+            update_spans,
+            errors,
+            error_spans,
+        } = buffers;
 
-        let mut dropped = 0;
+        self.update_receivers
+            .lock()
+            .unwrap()
+            .retain_mut(|receiver| {
+                let start = updates.len();
+                let abandoned = drain_queue(&mut receiver.updates, updates);
+                if updates.len() > start {
+                    update_spans.push(UpdateSpan {
+                        run: receiver.run,
+                        range: start..updates.len(),
+                    });
+                }
+                !abandoned
+            });
+
         let mut fatal_generation = None;
-        drain_receivers(&mut self.error_receivers.lock().unwrap(), |receiver| {
+        self.error_receivers.lock().unwrap().retain_mut(|receiver| {
             let start = errors.len();
-            if let Ok(chunk) = receiver.errors.read_chunk(receiver.errors.slots()) {
-                errors.extend(chunk);
-            }
-            dropped += receiver.dropped.swap(0, Ordering::Relaxed);
+            let abandoned = drain_queue(&mut receiver.errors, errors);
+            let dropped = receiver.dropped.swap(0, Ordering::Relaxed);
             if errors[start..].iter().any(|e| stops_stream(e.kind())) {
                 fatal_generation = Some(receiver.generation);
             }
-            receiver.errors.is_abandoned()
+            if errors.len() > start || dropped > 0 {
+                error_spans.push(ErrorSpan {
+                    generation: receiver.generation,
+                    run: receiver.run,
+                    range: start..errors.len(),
+                    dropped,
+                });
+            }
+            !abandoned
         });
 
         // Stop off the audio thread; dropping a stream from inside its own callbacks can deadlock
-        let stopped = fatal_generation.is_some_and(|generation| {
+        let stopped_generation = fatal_generation.filter(|&generation| {
             let _lifecycle = self.lifecycle.lock().unwrap();
             let stream = self.take_stream(Some(generation));
             stream.is_some()
         });
 
-        // Dispatch the whole drained batch to each subscriber in
-        // a single call, so consumers can amortize per-update work.
-        if !updates.is_empty() {
-            for subscriber in self.subscribers.lock().unwrap().map.values_mut() {
-                subscriber(updates);
+        // Dispatch each run's updates to each subscriber in a single call, so consumers can
+        // amortize per-update work
+        if !update_spans.is_empty() {
+            let mut subscribers = self.subscribers.lock().unwrap();
+            for span in update_spans.drain(..) {
+                let batch = UpdateBatch {
+                    run: span.run,
+                    updates: &updates[span.range],
+                };
+                for subscriber in subscribers.map.values_mut() {
+                    subscriber(&batch);
+                }
             }
             updates.clear();
         }
 
-        if !errors.is_empty() || dropped > 0 {
-            let batch = ErrorBatch {
-                errors,
-                dropped,
-                stopped,
-            };
-            for subscriber in self.error_subscribers.lock().unwrap().map.values_mut() {
-                subscriber(&batch);
+        if !error_spans.is_empty() {
+            let mut subscribers = self.error_subscribers.lock().unwrap();
+            for span in error_spans.drain(..) {
+                let batch = ErrorBatch {
+                    run: span.run,
+                    errors: &errors[span.range],
+                    dropped: span.dropped,
+                    stopped: stopped_generation == Some(span.generation),
+                };
+                for subscriber in subscribers.map.values_mut() {
+                    subscriber(&batch);
+                }
             }
             errors.clear();
         }
 
-        stopped
+        stopped_generation.is_some()
     }
 }
 
-/// Drain each receiver in order, dropping the ones whose stream is gone.
-///
-/// `drain` empties a receiver and then returns whether its producer is gone.
-fn drain_receivers<T>(receivers: &mut VecDeque<T>, mut drain: impl FnMut(&mut T) -> bool) {
-    receivers.retain_mut(|receiver| {
-        let abandoned = drain(receiver);
-        if abandoned {
-            // Catch anything pushed between the drain and the producer going away
-            drain(receiver);
+/// The update thread's buffers, reused across pumps so draining doesn't allocate.
+struct PumpBuffers<U> {
+    /// Updates drained from every receiver, one receiver after another
+    updates: Vec<U>,
+
+    /// Which part of `updates` each receiver yielded, oldest receiver first
+    update_spans: Vec<UpdateSpan>,
+
+    /// Errors drained from every receiver, one receiver after another
+    errors: Vec<StreamError>,
+
+    /// Which part of `errors` each receiver yielded, oldest receiver first
+    error_spans: Vec<ErrorSpan>,
+}
+
+impl<U> PumpBuffers<U> {
+    fn new(capacities: &QueueCapacities) -> Self {
+        Self {
+            updates: Vec::with_capacity(capacities.updates),
+            update_spans: Vec::new(),
+            errors: Vec::with_capacity(capacities.errors),
+            error_spans: Vec::new(),
         }
-        !abandoned
-    });
+    }
+}
+
+/// The updates one receiver yielded in a pump
+struct UpdateSpan {
+    run: RunId,
+    range: Range<usize>,
+}
+
+/// The errors one receiver yielded in a pump
+struct ErrorSpan {
+    generation: u64,
+    run: RunId,
+    range: Range<usize>,
+    dropped: usize,
+}
+
+/// Move everything in `queue` to the end of `into`, returning whether its producer is gone.
+fn drain_queue<T>(queue: &mut rtrb::Consumer<T>, into: &mut Vec<T>) -> bool {
+    let mut read = |queue: &mut rtrb::Consumer<T>| {
+        if let Ok(chunk) = queue.read_chunk(queue.slots()) {
+            into.extend(chunk);
+        }
+    };
+    read(queue);
+    let abandoned = queue.is_abandoned();
+    if abandoned {
+        // Catch anything pushed between the read and the producer going away
+        read(queue);
+    }
+    abandoned
 }
 
 /// Whether an error means the stream can't continue, so the loop stops itself.
@@ -291,8 +402,7 @@ where
             let (tx, rx) = std::sync::mpsc::sync_channel::<thread::Thread>(1);
 
             let handle = thread::spawn({
-                let mut updates = Vec::with_capacity(capacities.updates);
-                let mut errors = Vec::with_capacity(capacities.errors);
+                let mut buffers = PumpBuffers::new(&capacities);
                 move || {
                     // Get our own thread handle
                     let _self_handle = rx.recv().unwrap();
@@ -304,7 +414,7 @@ where
                         }
 
                         // A fatal-error stop leaves the stopped stream's queues to drain
-                        if shared.pump(&mut updates, &mut errors) {
+                        if shared.pump(&mut buffers) {
                             continue;
                         }
 
@@ -338,6 +448,7 @@ where
     /// - `device`: The audio device to use
     /// - `config`: The stream configuration
     /// - `runner`: The runner that will process audio and handle commands
+    /// - `run`: The id every batch of this run is delivered with; see [`RunId`]
     ///
     /// # Errors
     /// Returns an error if already running or if stream creation fails.
@@ -346,6 +457,7 @@ where
         device: AudioDevice,
         config: StreamConfig,
         mut runner: R,
+        run: RunId,
     ) -> Result<(), AudioLoopStartError> {
         let shared = &self.inner.shared;
         let mut next_generation = shared.lifecycle.lock().unwrap();
@@ -424,7 +536,10 @@ where
             .update_receivers
             .lock()
             .unwrap()
-            .push_back(update_receiver);
+            .push_back(UpdateReceiver {
+                updates: update_receiver,
+                run,
+            });
         shared
             .error_receivers
             .lock()
@@ -432,6 +547,7 @@ where
             .push_back(ErrorReceiver {
                 errors: error_receiver,
                 dropped: dropped_errors,
+                run,
                 generation,
             });
 
@@ -514,14 +630,15 @@ where
 
     /// Register a listener for updates coming from the audio loop.
     ///
-    /// The callback receives each wake-up's drained updates as a single batch,
-    /// in arrival order. Subscriptions persist across start/stop cycles.
+    /// The callback receives a batch for each stream whose queue yielded updates when the update
+    /// thread drained it, oldest stream first and each in arrival order. A run can get more than one
+    /// batch between two wake-ups. Subscriptions persist across start/stop cycles.
     ///
     /// # Warning
     /// The callback must not call `subscribe` or `unsubscribe` - doing so will deadlock.
     pub fn subscribe<F>(&self, callback: F) -> Subscription
     where
-        F: FnMut(&[R::Update]) + Send + 'static,
+        F: FnMut(&UpdateBatch<'_, R::Update>) + Send + 'static,
     {
         let id = self
             .inner
@@ -548,8 +665,10 @@ where
 
     /// Register a listener for errors reported by the audio stream.
     ///
-    /// The callback runs on the update thread and receives each wake-up's errors as a single
-    /// batch, in the order they were reported. Subscriptions persist across start/stop cycles.
+    /// The callback runs on the update thread and receives a batch for each stream whose queue
+    /// yielded errors when the update thread drained it, oldest stream first and each in the order
+    /// the errors were reported. A run can get more than one batch between two wake-ups.
+    /// Subscriptions persist across start/stop cycles.
     ///
     /// # Warning
     /// The callback must not call `subscribe_errors` or `unsubscribe_errors` - doing so will
@@ -905,7 +1024,7 @@ mod tests {
         let (batches_tx, batches_rx) = std::sync::mpsc::channel();
         let _subscription = handle.subscribe_errors(move |batch| {
             let kinds: Vec<_> = batch.errors.iter().map(|e| e.kind()).collect();
-            batches_tx.send((kinds, batch.dropped)).unwrap();
+            batches_tx.send((batch.run, kinds, batch.dropped)).unwrap();
         });
 
         // Stand in for a running stream's error callback
@@ -930,6 +1049,7 @@ mod tests {
             .push_back(ErrorReceiver {
                 errors: receiver,
                 dropped: Arc::clone(&dropped),
+                run: RunId(5),
                 generation: 0,
             });
         handle
@@ -941,7 +1061,8 @@ mod tests {
             .unwrap()
             .unpark();
 
-        let (kinds, batch_dropped) = batches_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (run, kinds, batch_dropped) = batches_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(run, RunId(5));
         assert_eq!(
             kinds,
             [StreamErrorKind::Xrun, StreamErrorKind::RealtimeDenied]
@@ -950,8 +1071,28 @@ mod tests {
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
 
+    /// A runner whose updates are numbers, for telling delivered updates apart.
+    struct Counter;
+
+    impl Runner for Counter {
+        type Command = ();
+        type Update = i32;
+
+        fn handle_command(&mut self, _: (), _: impl FnMut(i32) -> Result<(), i32>) {}
+
+        fn run(
+            &mut self,
+            _: &mut [f32],
+            _: Layout,
+            _: usize,
+            _: Timing,
+            _: impl FnMut(i32) -> Result<(), i32>,
+        ) {
+        }
+    }
+
     /// A `Shared` with nothing running, for driving [`Shared::pump`] directly.
-    fn idle_shared() -> Shared<Silence> {
+    fn idle_shared<R: Runner>() -> Shared<R> {
         Shared {
             lifecycle: Mutex::new(0),
             stream: Mutex::new(None),
@@ -962,36 +1103,80 @@ mod tests {
         }
     }
 
+    /// Empty buffers for a single [`Shared::pump`].
+    fn pump_buffers<U>() -> PumpBuffers<U> {
+        PumpBuffers::new(&QueueCapacities {
+            updates: 0,
+            commands: 0,
+            errors: 0,
+        })
+    }
+
+    /// Hand `shared` an update queue of the given run holding `updates`.
+    fn add_update_receiver(shared: &Shared<Counter>, run: RunId, updates: &[i32]) {
+        let (mut sender, receiver) = RingBuffer::new(4);
+        for &update in updates {
+            sender.push(update).unwrap();
+        }
+        shared
+            .update_receivers
+            .lock()
+            .unwrap()
+            .push_back(UpdateReceiver {
+                updates: receiver,
+                run,
+            });
+    }
+
+    /// Update batches as delivered, each as its run and updates.
+    type RecordedUpdates = Arc<Mutex<Vec<(RunId, Vec<i32>)>>>;
+
+    /// Record every update batch `shared` delivers.
+    fn record_updates(shared: &Shared<Counter>) -> RecordedUpdates {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&batches);
+        shared
+            .subscribers
+            .lock()
+            .unwrap()
+            .insert(Box::new(move |batch: &UpdateBatch<'_, i32>| {
+                sink.lock()
+                    .unwrap()
+                    .push((batch.run, batch.updates.to_vec()));
+            }));
+        batches
+    }
+
     #[test]
-    fn drain_receivers_keeps_order_and_retires_finished_queues() {
-        let (mut old_tx, old_rx) = RingBuffer::new(4);
-        let (mut new_tx, new_rx) = RingBuffer::new(4);
-        old_tx.push(1).unwrap();
-        old_tx.push(2).unwrap();
-        new_tx.push(3).unwrap();
-        drop(old_tx);
+    fn update_batches_are_per_run_oldest_first() {
+        let shared = idle_shared();
+        let batches = record_updates(&shared);
+        add_update_receiver(&shared, RunId(1), &[1, 2]);
+        add_update_receiver(&shared, RunId(2), &[3]);
 
-        let mut receivers = VecDeque::from([old_rx, new_rx]);
-        let mut drained = Vec::new();
-        let drain = |receiver: &mut rtrb::Consumer<i32>| {
-            while let Ok(value) = receiver.pop() {
-                drained.push(value);
-            }
-            receiver.is_abandoned()
-        };
-        drain_receivers(&mut receivers, drain);
+        shared.pump(&mut pump_buffers());
 
-        assert_eq!(drained, [1, 2, 3]);
         assert_eq!(
-            receivers.len(),
-            1,
-            "only the stopped stream's queue is retired"
+            *batches.lock().unwrap(),
+            [(RunId(1), vec![1, 2]), (RunId(2), vec![3])]
         );
     }
 
     #[test]
-    fn errors_left_by_a_stopped_stream_are_still_delivered() {
+    fn a_receiver_with_nothing_to_deliver_produces_no_batch() {
         let shared = idle_shared();
+        let batches = record_updates(&shared);
+        add_update_receiver(&shared, RunId(1), &[]);
+        add_update_receiver(&shared, RunId(2), &[3]);
+
+        shared.pump(&mut pump_buffers());
+
+        assert_eq!(*batches.lock().unwrap(), [(RunId(2), vec![3])]);
+    }
+
+    #[test]
+    fn error_batches_are_per_run() {
+        let shared = idle_shared::<Silence>();
         let batches = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&batches);
         shared
@@ -1000,7 +1185,64 @@ mod tests {
             .unwrap()
             .insert(Box::new(move |batch: &ErrorBatch<'_>| {
                 let kinds: Vec<_> = batch.errors.iter().map(|e| e.kind()).collect();
-                sink.lock().unwrap().push((kinds, batch.stopped));
+                sink.lock().unwrap().push((batch.run, kinds, batch.dropped));
+            }));
+        for (run, kind, dropped) in [
+            (RunId(1), StreamErrorKind::Xrun, 2),
+            (RunId(2), StreamErrorKind::RealtimeDenied, 5),
+        ] {
+            let (mut errors, receiver) = RingBuffer::new(4);
+            errors.push(StreamError::new(kind)).unwrap();
+            shared
+                .error_receivers
+                .lock()
+                .unwrap()
+                .push_back(ErrorReceiver {
+                    errors: receiver,
+                    dropped: Arc::new(AtomicUsize::new(dropped)),
+                    run,
+                    generation: run.0,
+                });
+        }
+
+        shared.pump(&mut pump_buffers());
+
+        assert_eq!(
+            *batches.lock().unwrap(),
+            [
+                (RunId(1), vec![StreamErrorKind::Xrun], 2),
+                (RunId(2), vec![StreamErrorKind::RealtimeDenied], 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn drain_queue_reads_everything_and_reports_a_gone_producer() {
+        let (mut sender, mut receiver) = RingBuffer::new(4);
+        sender.push(1).unwrap();
+        sender.push(2).unwrap();
+        let mut drained = Vec::new();
+
+        assert!(!drain_queue(&mut receiver, &mut drained));
+        sender.push(3).unwrap();
+        drop(sender);
+        assert!(drain_queue(&mut receiver, &mut drained));
+
+        assert_eq!(drained, [1, 2, 3]);
+    }
+
+    #[test]
+    fn errors_left_by_a_stopped_stream_are_still_delivered() {
+        let shared = idle_shared::<Silence>();
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&batches);
+        shared
+            .error_subscribers
+            .lock()
+            .unwrap()
+            .insert(Box::new(move |batch: &ErrorBatch<'_>| {
+                let kinds: Vec<_> = batch.errors.iter().map(|e| e.kind()).collect();
+                sink.lock().unwrap().push((batch.run, kinds, batch.stopped));
             }));
 
         // A stream that reported a fatal error and is already gone
@@ -1019,15 +1261,16 @@ mod tests {
             .push_back(ErrorReceiver {
                 errors: receiver,
                 dropped,
+                run: RunId(3),
                 generation: 7,
             });
 
-        let stopped = shared.pump(&mut Vec::new(), &mut Vec::new());
+        let stopped = shared.pump(&mut pump_buffers());
 
         assert!(!stopped, "no running stream of that generation to stop");
         assert_eq!(
             *batches.lock().unwrap(),
-            [(vec![StreamErrorKind::DeviceNotAvailable], false)]
+            [(RunId(3), vec![StreamErrorKind::DeviceNotAvailable], false)]
         );
         assert!(shared.error_receivers.lock().unwrap().is_empty());
     }
