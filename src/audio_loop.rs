@@ -100,7 +100,7 @@ where
 /// A running stream, owned by the handle
 struct RunningStream<C> {
     /// Dropping this stops the audio callback
-    _stream: cpal::Stream,
+    stream: cpal::Stream,
 
     /// Tells this stream apart from earlier and later ones
     generation: u64,
@@ -594,7 +594,7 @@ where
 
         // Store the stream, which marks the loop as running
         *shared.stream.lock().unwrap() = Some(RunningStream {
-            _stream: stream,
+            stream,
             generation,
             config,
             commands: command_sender,
@@ -652,6 +652,24 @@ where
             .unwrap()
             .as_ref()
             .map(|s| s.config.channels as usize)
+    }
+
+    /// Get the number of frames per callback the running stream reports.
+    ///
+    /// Read from the live stream rather than the requested config, so it also gives a size for
+    /// [`BufferSize::Default`]. It is the backend's estimate: whether it tracks changes during the
+    /// stream differs per backend, and a callback can still deliver a different number of frames.
+    ///
+    /// # Errors
+    /// Returns an error if the loop is not running, or if the backend can't report the size; the
+    /// latter is [`StreamErrorKind::UnsupportedOperation`] on backends with no way to query it.
+    ///
+    /// [`BufferSize::Default`]: crate::device::BufferSize::Default
+    pub fn buffer_size(&self) -> Result<u32, BufferSizeError> {
+        match &*self.inner.shared.stream.lock().unwrap() {
+            Some(running) => running.stream.buffer_size().map_err(BufferSizeError::Query),
+            None => Err(BufferSizeError::NotRunning),
+        }
     }
 
     /// Send a command to the runner in the audio loop.
@@ -990,6 +1008,16 @@ pub enum AudioLoopStartError {
     PlayStream(String),
 }
 
+/// An error that can occur when getting the running stream's buffer size
+#[derive(Debug, Error)]
+pub enum BufferSizeError {
+    #[error("Audio loop is not running")]
+    NotRunning,
+
+    #[error("Failed to get the stream's buffer size")]
+    Query(#[source] StreamError),
+}
+
 /// An error that can occur when sending a command
 #[derive(Debug, Error)]
 pub enum CommandError<C> {
@@ -1054,6 +1082,20 @@ mod tests {
     fn handle_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AudioLoopHandle<Silence>>();
+    }
+
+    #[test]
+    fn buffer_size_needs_a_running_stream() {
+        let handle = AudioLoopHandle::<Silence>::new(QueueCapacities {
+            updates: 1,
+            commands: 1,
+            errors: 1,
+        });
+
+        assert!(matches!(
+            handle.buffer_size(),
+            Err(BufferSizeError::NotRunning)
+        ));
     }
 
     #[test]
