@@ -30,10 +30,10 @@ impl AudioDevice {
     }
 
     /// Get the default output configuration for this device
-    pub fn default_output_config(&self) -> Result<StreamConfig, DefaultConfigError> {
+    pub fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultConfigError> {
         self.inner
             .default_output_config()
-            .map(StreamConfig::from)
+            .map(SupportedStreamConfig::from)
             .map_err(|_| DefaultConfigError)
     }
 
@@ -41,6 +41,11 @@ impl AudioDevice {
     ///
     /// Returns the first config that matches all specified criteria.
     /// Use `None` for channels/sample_rate you don't care about.
+    ///
+    /// A [`BufferSize::Fixed`] size must fall within the config's
+    /// [`SupportedStreamConfigRange::buffer_size`]. When that range is
+    /// [`SupportedBufferSize::Unknown`] the size can't be checked here, and building the stream
+    /// may still reject it.
     ///
     /// # Example
     /// ```ignore
@@ -67,6 +72,13 @@ impl AudioDevice {
             // Check if sample rate is in range (if specified)
             if let Some(sr) = sample_rate
                 && (sr < range.min_sample_rate() || sr > range.max_sample_rate())
+            {
+                continue;
+            }
+
+            // Check the buffer size against the range, where the platform reports one
+            if let BufferSize::Fixed(size) = buffer_size
+                && range.buffer_size().contains(size) == Some(false)
             {
                 continue;
             }
@@ -116,12 +128,81 @@ impl SupportedStreamConfigRange {
         self.inner.max_sample_rate()
     }
 
+    /// Get the range of buffer sizes supported, in frames
+    pub fn buffer_size(&self) -> SupportedBufferSize {
+        SupportedBufferSize::from(*self.inner.buffer_size())
+    }
+
     /// Get a config with a specific sample rate (clamped to supported range)
     pub fn with_sample_rate(&self, sample_rate: u32) -> StreamConfig {
         let clamped = sample_rate
             .max(self.min_sample_rate())
             .min(self.max_sample_rate());
-        StreamConfig::from(self.inner.with_sample_rate(clamped))
+        StreamConfig {
+            channels: self.channels(),
+            sample_rate: clamped,
+            buffer_size: BufferSize::Default,
+        }
+    }
+}
+
+/// A single supported stream configuration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupportedStreamConfig {
+    /// Number of channels
+    pub channels: u16,
+    /// Sample rate in Hz
+    pub sample_rate: u32,
+    /// Range of buffer sizes supported, in frames
+    pub buffer_size: SupportedBufferSize,
+}
+
+impl SupportedStreamConfig {
+    /// Get a stream config with these channels and sample rate, and [`BufferSize::Default`]
+    pub fn config(&self) -> StreamConfig {
+        StreamConfig {
+            channels: self.channels,
+            sample_rate: self.sample_rate,
+            buffer_size: BufferSize::Default,
+        }
+    }
+}
+
+impl From<cpal::SupportedStreamConfig> for SupportedStreamConfig {
+    fn from(config: cpal::SupportedStreamConfig) -> Self {
+        Self {
+            channels: config.channels(),
+            sample_rate: config.sample_rate(),
+            buffer_size: SupportedBufferSize::from(*config.buffer_size()),
+        }
+    }
+}
+
+/// The range of buffer sizes a device supports, in frames
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportedBufferSize {
+    /// Any size from `min` to `max`, both inclusive
+    Range { min: u32, max: u32 },
+    /// The platform can't tell before a stream starts
+    Unknown,
+}
+
+impl SupportedBufferSize {
+    /// Whether `size` frames falls within the range, or `None` if the range is unknown
+    pub fn contains(&self, size: u32) -> Option<bool> {
+        match *self {
+            Self::Range { min, max } => Some((min..=max).contains(&size)),
+            Self::Unknown => None,
+        }
+    }
+}
+
+impl From<cpal::SupportedBufferSize> for SupportedBufferSize {
+    fn from(size: cpal::SupportedBufferSize) -> Self {
+        match size {
+            cpal::SupportedBufferSize::Range { min, max } => Self::Range { min, max },
+            cpal::SupportedBufferSize::Unknown => Self::Unknown,
+        }
     }
 }
 
@@ -145,16 +226,6 @@ impl From<cpal::StreamConfig> for StreamConfig {
                 cpal::BufferSize::Default => BufferSize::Default,
                 cpal::BufferSize::Fixed(size) => BufferSize::Fixed(size),
             },
-        }
-    }
-}
-
-impl From<cpal::SupportedStreamConfig> for StreamConfig {
-    fn from(config: cpal::SupportedStreamConfig) -> Self {
-        Self {
-            channels: config.channels(),
-            sample_rate: config.sample_rate(),
-            buffer_size: BufferSize::Default,
         }
     }
 }
@@ -225,3 +296,39 @@ pub struct SupportedConfigsError;
 #[derive(Debug, Error)]
 #[error("Failed to get default configuration")]
 pub struct DefaultConfigError;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_range_contains_its_bounds() {
+        let range = SupportedBufferSize::Range { min: 64, max: 512 };
+
+        assert_eq!(range.contains(63), Some(false));
+        assert_eq!(range.contains(64), Some(true));
+        assert_eq!(range.contains(512), Some(true));
+        assert_eq!(range.contains(513), Some(false));
+    }
+
+    #[test]
+    fn an_unknown_range_cant_tell() {
+        assert_eq!(SupportedBufferSize::Unknown.contains(256), None);
+    }
+
+    #[test]
+    fn supported_config_keeps_the_buffer_size_range() {
+        let config = SupportedStreamConfig::from(cpal::SupportedStreamConfig::new(
+            2,
+            48_000,
+            cpal::SupportedBufferSize::Range { min: 15, max: 4096 },
+            cpal::SampleFormat::F32,
+        ));
+
+        assert_eq!(
+            config.buffer_size,
+            SupportedBufferSize::Range { min: 15, max: 4096 }
+        );
+        assert_eq!(config.config().buffer_size, BufferSize::Default);
+    }
+}
