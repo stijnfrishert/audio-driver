@@ -48,10 +48,11 @@ where
     capacities: QueueCapacities,
 }
 
-/// How many items each of the audio loop's queues can hold.
+/// How many items the audio loop's update, command and error queues can hold.
 ///
 /// Every stream gets fresh queues of these sizes when it starts. What happens when one fills up
-/// differs per queue, as documented on each field.
+/// differs per queue, as documented on each field. The garbage queue is sized by the runner
+/// instead; see [`Runner::garbage_capacity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueCapacities {
     /// Updates sent by the runner that haven't reached the subscribers yet; further updates are
@@ -85,6 +86,9 @@ where
 
     /// Error receivers of current and stopped streams, kept the same way
     error_receivers: Mutex<VecDeque<ErrorReceiver>>,
+
+    /// Garbage receivers of current and stopped streams, kept the same way
+    garbage_receivers: Mutex<VecDeque<GarbageReceiver<R::Garbage>>>,
 
     /// The subscribers for updates - persists across start/stop cycles
     subscribers: Mutex<SubscriptionMap<UpdateSubscriberFn<R::Update>>>,
@@ -139,6 +143,12 @@ struct ErrorReceiver {
 
     /// The generation of the stream reporting into this queue
     generation: u64,
+}
+
+/// The update thread's side of a stream's garbage queue
+struct GarbageReceiver<G> {
+    /// Consumer of the values retired by the runner
+    garbage: rtrb::Consumer<G>,
 }
 
 /// Updates sent by one run's runner since the last batch.
@@ -216,10 +226,11 @@ where
         }
     }
 
-    /// Drain every queue, stop a stream that reported a fatal error, and dispatch the batches.
+    /// Drain every queue, stop a fatally failed stream, dispatch the batches and drop garbage.
     ///
-    /// Each receiver that yielded something becomes one batch, oldest receiver first. Receivers
-    /// whose stream is gone are dropped once drained.
+    /// Each update or error receiver that yielded something becomes one batch, oldest receiver
+    /// first. Retired values are dropped after dispatch, so a large drop doesn't delay the batches
+    /// drained in the same pump. Receivers whose stream is gone are dropped once drained.
     ///
     /// Returns whether the stream was stopped, in which case its queues should be drained once
     /// more.
@@ -236,7 +247,7 @@ where
             .unwrap()
             .retain_mut(|receiver| {
                 let start = updates.len();
-                let abandoned = drain_queue(&mut receiver.updates, updates);
+                let abandoned = consume_queue(&mut receiver.updates, |chunk| updates.extend(chunk));
                 if updates.len() > start {
                     update_spans.push(UpdateSpan {
                         run: receiver.run,
@@ -249,7 +260,7 @@ where
         let mut fatal_generation = None;
         self.error_receivers.lock().unwrap().retain_mut(|receiver| {
             let start = errors.len();
-            let abandoned = drain_queue(&mut receiver.errors, errors);
+            let abandoned = consume_queue(&mut receiver.errors, |chunk| errors.extend(chunk));
             let dropped = receiver.dropped.swap(0, Ordering::Relaxed);
             if errors[start..].iter().any(|e| stops_stream(e.kind())) {
                 fatal_generation = Some(receiver.generation);
@@ -304,6 +315,13 @@ where
             errors.clear();
         }
 
+        self.garbage_receivers
+            .lock()
+            .unwrap()
+            .retain_mut(|receiver| {
+                !consume_queue(&mut receiver.garbage, |chunk| chunk.commit_all())
+            });
+
         stopped_generation.is_some()
     }
 }
@@ -348,11 +366,14 @@ struct ErrorSpan {
     dropped: usize,
 }
 
-/// Move everything in `queue` to the end of `into`, returning whether its producer is gone.
-fn drain_queue<T>(queue: &mut rtrb::Consumer<T>, into: &mut Vec<T>) -> bool {
+/// Hand everything in `queue` to `consume`, returning whether its producer is gone.
+fn consume_queue<T>(
+    queue: &mut rtrb::Consumer<T>,
+    mut consume: impl FnMut(rtrb::chunks::ReadChunk<'_, T>),
+) -> bool {
     let mut read = |queue: &mut rtrb::Consumer<T>| {
         if let Ok(chunk) = queue.read_chunk(queue.slots()) {
-            into.extend(chunk);
+            consume(chunk);
         }
     };
     read(queue);
@@ -388,6 +409,7 @@ where
             stream: Mutex::new(None),
             update_receivers: Mutex::new(VecDeque::new()),
             error_receivers: Mutex::new(VecDeque::new()),
+            garbage_receivers: Mutex::new(VecDeque::new()),
             subscribers: Mutex::new(SubscriptionMap::new()),
             error_subscribers: Mutex::new(SubscriptionMap::new()),
         });
@@ -481,6 +503,9 @@ where
         let (mut error_sender, error_receiver) = RingBuffer::new(self.inner.capacities.errors);
         let dropped_errors = Arc::new(AtomicUsize::new(0));
 
+        // Create garbage ring buffer, sized by the runner before it moves into the callback
+        let (mut garbage_sender, garbage_receiver) = RingBuffer::new(runner.garbage_capacity());
+
         // Prepare data for the audio and error callbacks
         let update_thread = self.inner.update_thread.lock().unwrap().clone();
         let error_update_thread = update_thread.clone();
@@ -496,20 +521,27 @@ where
                 move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     // Handle commands queued since the last callback
                     while let Ok(command) = command_receiver.pop() {
-                        runner.handle_command(command, |update| {
-                            push_update(&mut update_sender, update)
-                        });
+                        runner.handle_command(
+                            command,
+                            |update| push_or_hand_back(&mut update_sender, update),
+                            |value| push_or_hand_back(&mut garbage_sender, value),
+                        );
                     }
 
                     debug_assert_eq!(data.len() % channels, 0, "partial frame in buffer");
                     let frames = data.len() / channels;
                     let timing = clock.advance(frames, info.timestamp());
 
-                    runner.run(data, Layout::Interleaved, frames, timing, |update| {
-                        push_update(&mut update_sender, update)
-                    });
+                    runner.run(
+                        data,
+                        Layout::Interleaved,
+                        frames,
+                        timing,
+                        |update| push_or_hand_back(&mut update_sender, update),
+                        |value| push_or_hand_back(&mut garbage_sender, value),
+                    );
 
-                    // Wake the update thread to process any new updates
+                    // Wake the update thread to deliver new updates and drop retired values
                     if let Some(ref thread) = update_thread {
                         thread.unpark();
                     }
@@ -531,7 +563,7 @@ where
             .play()
             .map_err(|e| AudioLoopStartError::PlayStream(e.to_string()))?;
 
-        // Pass the update and error receivers to the update thread
+        // Pass the update, error and garbage receivers to the update thread
         shared
             .update_receivers
             .lock()
@@ -540,6 +572,7 @@ where
                 updates: update_receiver,
                 run,
             });
+
         shared
             .error_receivers
             .lock()
@@ -549,6 +582,14 @@ where
                 dropped: dropped_errors,
                 run,
                 generation,
+            });
+
+        shared
+            .garbage_receivers
+            .lock()
+            .unwrap()
+            .push_back(GarbageReceiver {
+                garbage: garbage_receiver,
             });
 
         // Store the stream, which marks the loop as running
@@ -701,11 +742,11 @@ where
     }
 }
 
-/// Queue an update for the subscribers, handing it back if the queue is full.
-fn push_update<U>(updates: &mut rtrb::Producer<U>, update: U) -> Result<(), U> {
-    updates
-        .push(update)
-        .map_err(|rtrb::PushError::Full(update)| update)
+/// Queue a value for the update thread, handing it back if the queue is full.
+fn push_or_hand_back<T>(queue: &mut rtrb::Producer<T>, value: T) -> Result<(), T> {
+    queue
+        .push(value)
+        .map_err(|rtrb::PushError::Full(value)| value)
 }
 
 /// Queue a stream error for the update thread, counting it as dropped if the queue is full.
@@ -890,12 +931,25 @@ impl FrameClock {
 /// Both send updates through `on_update`, which hands an update back as `Err` when the update
 /// queue is full (see [`QueueCapacities::updates`]). The runner decides what that means: keep the
 /// latest value and send it with a later buffer, retry an event that must arrive, or drop it.
+///
+/// Values the runner no longer needs go through `on_retire` and are dropped on the update thread,
+/// never by the runner itself. `on_retire` likewise hands a value back as `Err` when the garbage
+/// queue is full (see [`Self::garbage_capacity`]), and the runner decides what to do with it.
 pub trait Runner: Send {
     /// The type of commands that can be sent to the runner
     type Command: Send + 'static;
 
     /// The type of updates that can be sent out of the runner
     type Update: Send + 'static;
+
+    /// The type of values the runner retires, to be dropped on the update thread
+    type Garbage: Send + 'static;
+
+    /// How many values the runner may retire between two drains by the update thread.
+    ///
+    /// Called once per stream in [`AudioLoopHandle::start`], before the runner moves into the audio
+    /// callback, to size that stream's garbage queue. A runner that never retires returns 0.
+    fn garbage_capacity(&self) -> usize;
 
     /// Handle a command that was sent to the runner.
     ///
@@ -906,6 +960,7 @@ pub trait Runner: Send {
         &mut self,
         command: Self::Command,
         on_update: impl FnMut(Self::Update) -> Result<(), Self::Update>,
+        on_retire: impl FnMut(Self::Garbage) -> Result<(), Self::Garbage>,
     );
 
     /// Process audio and send out updates if need be.
@@ -918,6 +973,7 @@ pub trait Runner: Send {
         len: usize,
         timing: Timing,
         on_update: impl FnMut(Self::Update) -> Result<(), Self::Update>,
+        on_retire: impl FnMut(Self::Garbage) -> Result<(), Self::Garbage>,
     );
 }
 
@@ -968,8 +1024,19 @@ mod tests {
     impl Runner for Silence {
         type Command = ();
         type Update = ();
+        type Garbage = ();
 
-        fn handle_command(&mut self, _: (), _: impl FnMut(()) -> Result<(), ()>) {}
+        fn garbage_capacity(&self) -> usize {
+            0
+        }
+
+        fn handle_command(
+            &mut self,
+            _: (),
+            _: impl FnMut(()) -> Result<(), ()>,
+            _: impl FnMut(()) -> Result<(), ()>,
+        ) {
+        }
 
         fn run(
             &mut self,
@@ -977,6 +1044,7 @@ mod tests {
             _: Layout,
             _: usize,
             _: Timing,
+            _: impl FnMut(()) -> Result<(), ()>,
             _: impl FnMut(()) -> Result<(), ()>,
         ) {
         }
@@ -1071,14 +1139,25 @@ mod tests {
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
 
-    /// A runner whose updates are numbers, for telling delivered updates apart.
+    /// A runner whose updates are numbers and whose garbage counts its drops.
     struct Counter;
 
     impl Runner for Counter {
         type Command = ();
         type Update = i32;
+        type Garbage = Tracked;
 
-        fn handle_command(&mut self, _: (), _: impl FnMut(i32) -> Result<(), i32>) {}
+        fn garbage_capacity(&self) -> usize {
+            0
+        }
+
+        fn handle_command(
+            &mut self,
+            _: (),
+            _: impl FnMut(i32) -> Result<(), i32>,
+            _: impl FnMut(Tracked) -> Result<(), Tracked>,
+        ) {
+        }
 
         fn run(
             &mut self,
@@ -1087,8 +1166,37 @@ mod tests {
             _: usize,
             _: Timing,
             _: impl FnMut(i32) -> Result<(), i32>,
+            _: impl FnMut(Tracked) -> Result<(), Tracked>,
         ) {
         }
+    }
+
+    /// A retired value that records the thread of each drop.
+    struct Tracked(Arc<Mutex<Vec<thread::ThreadId>>>);
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push(thread::current().id());
+        }
+    }
+
+    /// Hand `shared` a garbage queue of `count` values tracked in `drops`; returns its producer.
+    fn add_garbage_receiver(
+        shared: &Shared<Counter>,
+        drops: &Arc<Mutex<Vec<thread::ThreadId>>>,
+        count: usize,
+    ) -> rtrb::Producer<Tracked> {
+        let (mut sender, receiver) = RingBuffer::new(4);
+        for _ in 0..count {
+            push_or_hand_back(&mut sender, Tracked(Arc::clone(drops)))
+                .unwrap_or_else(|_| panic!("garbage queue full"));
+        }
+        shared
+            .garbage_receivers
+            .lock()
+            .unwrap()
+            .push_back(GarbageReceiver { garbage: receiver });
+        sender
     }
 
     /// A `Shared` with nothing running, for driving [`Shared::pump`] directly.
@@ -1098,6 +1206,7 @@ mod tests {
             stream: Mutex::new(None),
             update_receivers: Mutex::new(VecDeque::new()),
             error_receivers: Mutex::new(VecDeque::new()),
+            garbage_receivers: Mutex::new(VecDeque::new()),
             subscribers: Mutex::new(SubscriptionMap::new()),
             error_subscribers: Mutex::new(SubscriptionMap::new()),
         }
@@ -1217,16 +1326,16 @@ mod tests {
     }
 
     #[test]
-    fn drain_queue_reads_everything_and_reports_a_gone_producer() {
+    fn consume_queue_reads_everything_and_reports_a_gone_producer() {
         let (mut sender, mut receiver) = RingBuffer::new(4);
         sender.push(1).unwrap();
         sender.push(2).unwrap();
         let mut drained = Vec::new();
 
-        assert!(!drain_queue(&mut receiver, &mut drained));
+        assert!(!consume_queue(&mut receiver, |chunk| drained.extend(chunk)));
         sender.push(3).unwrap();
         drop(sender);
-        assert!(drain_queue(&mut receiver, &mut drained));
+        assert!(consume_queue(&mut receiver, |chunk| drained.extend(chunk)));
 
         assert_eq!(drained, [1, 2, 3]);
     }
@@ -1287,14 +1396,103 @@ mod tests {
     }
 
     #[test]
-    fn push_update_hands_back_what_doesnt_fit() {
-        let (mut updates, mut receiver) = RingBuffer::new(1);
+    fn push_or_hand_back_hands_back_what_doesnt_fit() {
+        let (mut queue, mut receiver) = RingBuffer::new(1);
 
-        assert_eq!(push_update(&mut updates, 1), Ok(()));
-        assert_eq!(push_update(&mut updates, 2), Err(2));
+        assert_eq!(push_or_hand_back(&mut queue, 1), Ok(()));
+        assert_eq!(push_or_hand_back(&mut queue, 2), Err(2));
 
         assert_eq!(receiver.pop(), Ok(1));
-        assert_eq!(push_update(&mut updates, 3), Ok(()));
+        assert_eq!(push_or_hand_back(&mut queue, 3), Ok(()));
+    }
+
+    #[test]
+    fn push_or_hand_back_hands_back_everything_at_zero_capacity() {
+        let (mut queue, _receiver) = RingBuffer::new(0);
+
+        assert_eq!(push_or_hand_back(&mut queue, 1), Err(1));
+    }
+
+    #[test]
+    fn garbage_is_dropped_by_pump() {
+        let shared = idle_shared();
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let sender = add_garbage_receiver(&shared, &drops, 3);
+
+        shared.pump(&mut pump_buffers());
+        assert_eq!(drops.lock().unwrap().len(), 3);
+        assert_eq!(shared.garbage_receivers.lock().unwrap().len(), 1);
+
+        drop(sender);
+        shared.pump(&mut pump_buffers());
+        assert!(shared.garbage_receivers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn garbage_left_by_a_stopped_stream_is_still_dropped() {
+        let shared = idle_shared();
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        drop(add_garbage_receiver(&shared, &drops, 2));
+
+        shared.pump(&mut pump_buffers());
+
+        assert_eq!(drops.lock().unwrap().len(), 2);
+        assert!(shared.garbage_receivers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn garbage_is_dropped_after_updates_are_dispatched() {
+        let shared = idle_shared();
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let drops = Arc::clone(&drops);
+            let seen = Arc::clone(&seen);
+            shared
+                .subscribers
+                .lock()
+                .unwrap()
+                .insert(Box::new(move |_: &UpdateBatch<'_, i32>| {
+                    seen.lock().unwrap().push(drops.lock().unwrap().len());
+                }));
+        }
+        add_update_receiver(&shared, RunId(1), &[1]);
+        let _sender = add_garbage_receiver(&shared, &drops, 2);
+
+        shared.pump(&mut pump_buffers());
+
+        assert_eq!(*seen.lock().unwrap(), [0]);
+        assert_eq!(drops.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn garbage_is_dropped_on_the_update_thread() {
+        let handle = AudioLoopHandle::<Counter>::new(QueueCapacities {
+            updates: 1,
+            commands: 1,
+            errors: 1,
+        });
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let update_thread = handle.inner.update_thread.lock().unwrap().clone().unwrap();
+
+        // Stand in for a running stream's audio callback
+        let sender = add_garbage_receiver(&handle.inner.shared, &drops, 2);
+        drop(sender);
+        update_thread.unpark();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while drops.lock().unwrap().len() < 2 {
+            assert!(std::time::Instant::now() < deadline, "garbage not dropped");
+            thread::yield_now();
+        }
+        assert!(
+            drops
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|&id| id == update_thread.id())
+        );
+        assert_ne!(update_thread.id(), thread::current().id());
     }
 
     #[test]
