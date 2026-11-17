@@ -473,7 +473,12 @@ where
     /// - `run`: The id every batch of this run is delivered with; see [`RunId`]
     ///
     /// # Errors
-    /// Returns an error if already running or if stream creation fails.
+    /// Returns an error if already running or if stream creation fails. On backends that check the
+    /// config against the device, CoreAudio among them, one it doesn't support (such as a
+    /// [`BufferSize::Fixed`] size outside its range) fails with [`AudioLoopStartError::BuildStream`]
+    /// of kind [`StreamErrorKind::UnsupportedConfig`].
+    ///
+    /// [`BufferSize::Fixed`]: crate::device::BufferSize::Fixed
     pub fn start(
         &self,
         device: AudioDevice,
@@ -556,12 +561,10 @@ where
                 },
                 None,
             )
-            .map_err(|e| AudioLoopStartError::BuildStream(e.to_string()))?;
+            .map_err(AudioLoopStartError::BuildStream)?;
 
         // Start playing
-        stream
-            .play()
-            .map_err(|e| AudioLoopStartError::PlayStream(e.to_string()))?;
+        stream.play().map_err(AudioLoopStartError::PlayStream)?;
 
         // Pass the update, error and garbage receivers to the update thread
         shared
@@ -1001,11 +1004,11 @@ pub enum AudioLoopStartError {
     #[error("Audio loop is already running")]
     AlreadyRunning,
 
-    #[error("Failed to build audio stream: {0}")]
-    BuildStream(String),
+    #[error("Failed to build audio stream")]
+    BuildStream(#[source] StreamError),
 
-    #[error("Failed to start audio stream: {0}")]
-    PlayStream(String),
+    #[error("Failed to start audio stream")]
+    PlayStream(#[source] StreamError),
 }
 
 /// An error that can occur when getting the running stream's buffer size
