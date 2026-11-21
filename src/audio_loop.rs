@@ -483,6 +483,15 @@ where
         mut runner: R,
         run: RunId,
     ) -> Result<(), AudioLoopStartError> {
+        // Create the queues before taking the lifecycle lock, so a panic over a capacity (from the
+        // runner or rtrb) can't poison it
+        let (command_sender, mut command_receiver) =
+            RingBuffer::new(self.inner.capacities.commands);
+        let (mut update_sender, update_receiver) = RingBuffer::new(runner.update_capacity());
+        let (mut error_sender, error_receiver) = RingBuffer::new(self.inner.capacities.errors);
+        let dropped_errors = Arc::new(AtomicUsize::new(0));
+        let (mut garbage_sender, garbage_receiver) = RingBuffer::new(runner.garbage_capacity());
+
         let shared = &self.inner.shared;
         let mut next_generation = shared.lifecycle.lock().unwrap();
 
@@ -493,20 +502,6 @@ where
 
         let generation = *next_generation;
         *next_generation += 1;
-
-        // Create command ring buffer
-        let (command_sender, mut command_receiver) =
-            RingBuffer::new(self.inner.capacities.commands);
-
-        // Create update ring buffer, sized by the runner before it moves into the callback
-        let (mut update_sender, update_receiver) = RingBuffer::new(runner.update_capacity());
-
-        // Create error ring buffer
-        let (mut error_sender, error_receiver) = RingBuffer::new(self.inner.capacities.errors);
-        let dropped_errors = Arc::new(AtomicUsize::new(0));
-
-        // Create garbage ring buffer, sized by the runner before it moves into the callback
-        let (mut garbage_sender, garbage_receiver) = RingBuffer::new(runner.garbage_capacity());
 
         // Prepare data for the audio and error callbacks
         let update_thread = self.inner.update_thread.lock().unwrap().clone();
