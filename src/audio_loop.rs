@@ -44,21 +44,17 @@ where
     /// Thread handle for unparking the update thread
     update_thread: Mutex<Option<thread::Thread>>,
 
-    /// Sizes of the queues created for each stream
+    /// Sizes of the command and error queues created for each stream
     capacities: QueueCapacities,
 }
 
-/// How many items the audio loop's update, command and error queues can hold.
+/// How many items the audio loop's command and error queues can hold.
 ///
 /// Every stream gets fresh queues of these sizes when it starts. What happens when one fills up
-/// differs per queue, as documented on each field. The garbage queue is sized by the runner
-/// instead; see [`Runner::garbage_capacity`].
+/// differs per queue, as documented on each field. The runner sizes the update and garbage queues
+/// instead; see [`Runner::update_capacity`] and [`Runner::garbage_capacity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueCapacities {
-    /// Updates sent by the runner that haven't reached the subscribers yet; further updates are
-    /// handed back to the runner
-    pub updates: usize,
-
     /// Commands sent to the runner that haven't been handled yet; further sends fail with
     /// [`CommandError::QueueFull`]
     pub commands: usize,
@@ -326,7 +322,7 @@ where
     }
 }
 
-/// The update thread's buffers, reused across pumps so draining doesn't allocate.
+/// The update thread's buffers, reused across pumps, so draining allocates only to grow them.
 struct PumpBuffers<U> {
     /// Updates drained from every receiver, one receiver after another
     updates: Vec<U>,
@@ -344,7 +340,7 @@ struct PumpBuffers<U> {
 impl<U> PumpBuffers<U> {
     fn new(capacities: &QueueCapacities) -> Self {
         Self {
-            updates: Vec::with_capacity(capacities.updates),
+            updates: Vec::new(),
             update_spans: Vec::new(),
             errors: Vec::with_capacity(capacities.errors),
             error_spans: Vec::new(),
@@ -402,7 +398,8 @@ where
     /// The handle starts in a stopped state. Call `start()` to begin audio processing.
     ///
     /// # Parameters
-    /// - `capacities`: Sizes of the queues between the caller, the runner and the subscribers
+    /// - `capacities`: Sizes of each stream's command and error queues; the runner sizes its update
+    ///   and garbage queues through [`Runner::update_capacity`] and [`Runner::garbage_capacity`]
     pub fn new(capacities: QueueCapacities) -> Self {
         let shared = Arc::new(Shared {
             lifecycle: Mutex::new(0),
@@ -501,8 +498,8 @@ where
         let (command_sender, mut command_receiver) =
             RingBuffer::new(self.inner.capacities.commands);
 
-        // Create update ring buffer
-        let (mut update_sender, update_receiver) = RingBuffer::new(self.inner.capacities.updates);
+        // Create update ring buffer, sized by the runner before it moves into the callback
+        let (mut update_sender, update_receiver) = RingBuffer::new(runner.update_capacity());
 
         // Create error ring buffer
         let (mut error_sender, error_receiver) = RingBuffer::new(self.inner.capacities.errors);
@@ -950,7 +947,7 @@ impl FrameClock {
 /// free; any of these can make a buffer late and cause an audible dropout.
 ///
 /// Both send updates through `on_update`, which hands an update back as `Err` when the update
-/// queue is full (see [`QueueCapacities::updates`]). The runner decides what that means: keep the
+/// queue is full (see [`Self::update_capacity`]). The runner decides what that means: keep the
 /// latest value and send it with a later buffer, retry an event that must arrive, or drop it.
 ///
 /// Values the runner no longer needs go through `on_retire` and are dropped on the update thread,
@@ -965,6 +962,13 @@ pub trait Runner: Send {
 
     /// The type of values the runner retires, to be dropped on the update thread
     type Garbage: Send + 'static;
+
+    /// How many updates the runner may send between two drains by the update thread.
+    ///
+    /// Called once per stream in [`AudioLoopHandle::start`], before the runner moves into the audio
+    /// callback, to size that stream's update queue; an update past it is handed back through
+    /// `on_update`'s `Err`. A runner that sends nothing returns 0.
+    fn update_capacity(&self) -> usize;
 
     /// How many values the runner may retire between two drains by the update thread.
     ///
@@ -1057,6 +1061,10 @@ mod tests {
         type Update = ();
         type Garbage = ();
 
+        fn update_capacity(&self) -> usize {
+            0
+        }
+
         fn garbage_capacity(&self) -> usize {
             0
         }
@@ -1090,7 +1098,6 @@ mod tests {
     #[test]
     fn buffer_size_needs_a_running_stream() {
         let handle = AudioLoopHandle::<Silence>::new(QueueCapacities {
-            updates: 1,
             commands: 1,
             errors: 1,
         });
@@ -1130,7 +1137,6 @@ mod tests {
     #[test]
     fn update_thread_delivers_errors_as_a_batch() {
         let handle = AudioLoopHandle::<Silence>::new(QueueCapacities {
-            updates: 1,
             commands: 1,
             errors: 4,
         });
@@ -1191,6 +1197,10 @@ mod tests {
         type Command = ();
         type Update = i32;
         type Garbage = Tracked;
+
+        fn update_capacity(&self) -> usize {
+            0
+        }
 
         fn garbage_capacity(&self) -> usize {
             0
@@ -1260,7 +1270,6 @@ mod tests {
     /// Empty buffers for a single [`Shared::pump`].
     fn pump_buffers<U>() -> PumpBuffers<U> {
         PumpBuffers::new(&QueueCapacities {
-            updates: 0,
             commands: 0,
             errors: 0,
         })
@@ -1513,7 +1522,6 @@ mod tests {
     #[test]
     fn garbage_is_dropped_on_the_update_thread() {
         let handle = AudioLoopHandle::<Counter>::new(QueueCapacities {
-            updates: 1,
             commands: 1,
             errors: 1,
         });
